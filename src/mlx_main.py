@@ -16,7 +16,7 @@ class ModelParams(NamedTuple):
   n_local_heads: int
   n_local_kv_heads: int
   head_dim: int
-  max_seq_len: int
+  max_seqlen: int
   rope_theta: float
   use_scaled_rope: bool
 
@@ -26,7 +26,7 @@ LLAMA_1B_PARAMS = ModelParams(
   n_local_heads=32,
   n_local_kv_heads=8,
   head_dim=64,
-  max_seq_len=4096,
+  max_seqlen=4096,
   rope_theta=500000.0,
   use_scaled_rope=True,
 )
@@ -55,13 +55,13 @@ class Rope:
   def __init__(
     self,
     dim: int,
-    max_seq_len: int,
+    max_seqlen: int,
     theta: float = 500000.0,
     use_scaled: bool = True,
     dtype=mx.float32,
   ):
     self.dim = dim
-    self.max_seq_len = max_seq_len
+    self.max_seqlen = max_seqlen
     self.theta = theta
     self.use_scaled = use_scaled
     self.dtype = dtype
@@ -76,19 +76,19 @@ class Rope:
     )
     if self.use_scaled:
       pass  # No scaling implemented yet
-    t = mx.arange(self.max_seq_len, dtype=self.dtype)
+    t = mx.arange(self.max_seqlen, dtype=self.dtype)
     freqs = mx.outer(t, freqs)
     freqs = mx.exp(1j * freqs)
     return imag(freqs), real(freqs)
 
   # TODO: why is there a seqlen here
-  def apply_rotary_emb(self, xq, xk, start_pos: int, seq_len: Optional[int] = None):
-    if seq_len is None:
+  def apply_rotary_emb(self, xq, xk, start_pos: int, seqlen: Optional[int] = None):
+    if seqlen is None:
       freqs_sin = self.freqs_sin[start_pos : start_pos + 1]
       freqs_cos = self.freqs_cos[start_pos : start_pos + 1]
     else:
-      freqs_sin = self.freqs_sin[:seq_len]
-      freqs_cos = self.freqs_cos[:seq_len]
+      freqs_sin = self.freqs_sin[:seqlen]
+      freqs_cos = self.freqs_cos[:seqlen]
     xq_r, xq_i = xq[..., ::2], xq[..., 1::2]
     xk_r, xk_i = xk[..., ::2], xk[..., 1::2]
     freqs_sin = freqs_sin[None, :, None, :]
@@ -113,7 +113,7 @@ class KVCache(NamedTuple):
         (
           model_params.n_layers,
           bsz,
-          model_params.max_seq_len,
+          model_params.max_seqlen,
           model_params.n_local_kv_heads,
           model_params.head_dim,
         )
@@ -122,7 +122,7 @@ class KVCache(NamedTuple):
         (
           model_params.n_layers,
           bsz,
-          model_params.max_seq_len,
+          model_params.max_seqlen,
           model_params.n_local_kv_heads,
           model_params.head_dim,
         )
@@ -341,7 +341,7 @@ class Llama:
     chat_id = hashlib.md5(str(time.time()).encode("utf-8")).hexdigest()
     cur_pos = 0
 
-    while cur_pos < self.params.max_seq_len:
+    while cur_pos < self.params.max_seqlen:
       x = tokens if cur_pos == 0 else tokens[:, -1:]
       attn_mask = attn_mask if cur_pos == 0 else mx.array([0])
       logits, self.kvcache = self.xfmr(x, self.kvcache, cur_pos, attn_mask)  # type: ignore
@@ -424,7 +424,7 @@ class Transformer:
     self.weights = weights
     self.rope = Rope(
       dim=model_params.head_dim,
-      max_seq_len=model_params.max_seq_len,
+      max_seqlen=model_params.max_seqlen,
       theta=model_params.rope_theta,
       use_scaled=model_params.use_scaled_rope,
     )
@@ -458,7 +458,7 @@ if __name__ == "__main__":
   is_instruct = True
   weight_path, tok_path = "src/model/1B", "src/tokenizer.model"
   weight_path = weight_path + "-Instruct" if is_instruct else weight_path
-  prompts = ["Which is bigger, 9.11 or 9.9?"]
+  prompts = ["What is the capital of France?"]
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]))
