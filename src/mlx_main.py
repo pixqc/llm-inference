@@ -224,6 +224,7 @@ class Llama:
     self.is_instruct = is_instruct
     self.weights = self._load_weights(weights_path)
     self.tokenizer = Tokenizer(tokenizer_path)
+    self.stop_tokens = [128001, 128008, 128009]
     self.xfmr = Transformer(model_params, self.weights)
     self.kvcache = KVCache.init(bsz, model_params)
     self.freqs_cis_all = Rope.precompute_freqs_cis(
@@ -336,7 +337,6 @@ class Llama:
     **kwargs,
   ):
     assert len(tokens.shape) == 2, "tokens must be shape (bsz, seqlen)"
-    STOP_TOKENS = [128001, 128008, 128009]
     chat_id = hashlib.md5(str(time.time()).encode("utf-8")).hexdigest()
     cur_pos = 0
 
@@ -352,12 +352,8 @@ class Llama:
       logits, self.kvcache = self.xfmr(x, self.kvcache, cur_pos, attn_mask, freqs_cis)  # type: ignore
       candidates, logprobs = self._get_candidates(logits, sampler, temp=temp, **kwargs)
       next_token, _ = self._random_sample(candidates, logprobs, sampler)
-      is_stop = next_token[0] in STOP_TOKENS
-
-      if cur_pos == 0:
-        cur_pos = tokens.shape[-1]
-      else:
-        cur_pos += 1
+      is_stop = next_token[0] in self.stop_tokens
+      cur_pos = tokens.shape[-1] if cur_pos == 0 else cur_pos + 1
 
       yield {
         "id": f"chatcmpl-{chat_id}",
