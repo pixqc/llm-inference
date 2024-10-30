@@ -347,6 +347,7 @@ class Llama:
       logits, self.kvcache = self.xfmr(x, self.kvcache, cur_pos, attn_mask)  # type: ignore
       candidates, logprobs = self._get_candidates(logits, sampler, temp=temp, **kwargs)
       next_token, _ = self._random_sample(candidates, logprobs, sampler)
+      is_stop = next_token[0] in STOP_TOKENS
 
       if cur_pos == 0:
         cur_pos = tokens.shape[-1]
@@ -362,7 +363,7 @@ class Llama:
           {
             "index": 0,
             "delta": {"content": self.tokenizer.decode(next_token[0].tolist())},  # type: ignore
-            "finish_reason": "stop" if next_token[0] in STOP_TOKENS else None,
+            "finish_reason": "stop" if is_stop else None,
           }
         ],
         "current_token_position": cur_pos,
@@ -371,7 +372,7 @@ class Llama:
           for token, logprob in zip(candidates[0].tolist(), logprobs[0].tolist())  # type: ignore
         ],
       }
-      if next_token[0] in STOP_TOKENS:
+      if is_stop:
         break
       tokens = mx.concatenate([tokens, next_token], axis=1)
 
