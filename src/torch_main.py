@@ -67,7 +67,7 @@ class Rope:
     max_seqlen: int,
     theta: float = 500000.0,
     use_scaled: bool = True,
-    dtype=torch.float32,
+    dtype=torch.bfloat16,
   ) -> torch.Tensor:
     freqs = 1.0 / (
       theta ** (torch.arange(0, dim, 2, dtype=dtype, device=device)[: (dim // 2)] / dim)
@@ -92,7 +92,7 @@ class Rope:
     xq: torch.Tensor,
     xk: torch.Tensor,
     freqs_cis: torch.Tensor,
-    dtype: torch.dtype = torch.float32,
+    dtype: torch.dtype = torch.bfloat16,
   ) -> Tuple[torch.Tensor, torch.Tensor]:
     reshape_xq = xq.float().reshape(*xq.shape[:-1], -1, 2)
     reshape_xk = xk.float().reshape(*xk.shape[:-1], -1, 2)
@@ -125,6 +125,7 @@ class KVCache(NamedTuple):
           model_params.head_dim,
         ),
         device=device,
+        dtype=torch.bfloat16,
       ),
       v=torch.zeros(
         (
@@ -135,6 +136,7 @@ class KVCache(NamedTuple):
           model_params.head_dim,
         ),
         device=device,
+        dtype=torch.bfloat16,
       ),
     )
 
@@ -430,7 +432,7 @@ class AttentionBlock:
     xk, xv, kvcache = kvcache.update(self.idx, bsz, cur_pos, xk, xv, hc // gsz)
     scores = torch.einsum("bihd,bjhd->bhij", xq, xk)
     scores = (scores + mask) / (hsz**0.5)
-    scores = F.softmax(scores, dim=-1)
+    scores = F.softmax(scores, dim=-1).to(torch.bfloat16)
     out = torch.einsum("bhij,bjhk->bihk", scores, xv)
     out = out.reshape(out.shape[0], out.shape[1], -1)
     return out @ self.weights.wo.T, kvcache
