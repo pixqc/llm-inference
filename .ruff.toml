@@ -1,0 +1,5 @@
+indent-width = 2
+
+[lint]
+extend-select = ["I"]
+ignore = ["E731", "E701"]
