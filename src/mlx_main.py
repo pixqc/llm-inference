@@ -281,18 +281,12 @@ class Llama:
     return padded, (padded == pad_id)
 
   def _build_attn_mask(self, seqlen: int, pad_mask: Optional[mx.array]):
-    mask = mx.zeros((seqlen, seqlen), dtype=mx.float32)
-    if seqlen > 1:
-      mask = mx.full((seqlen, seqlen), float("-inf"))
-      mask = mx.triu(mask, k=1)
-    if pad_mask is None:
-      return mask
-    src_mask = pad_mask[:, :, None]
-    target_mask = pad_mask[:, None, :]
-    pad_mask = src_mask | target_mask
-    mask = mx.broadcast_to(mask[None, :, :], (pad_mask.shape[0], seqlen, seqlen))  # noqa
-    mask = mx.where(pad_mask, float("-inf"), mask)[:, None, :, :]
-    return mask
+    mask = mx.full((seqlen, seqlen), float("-inf"))
+    mask = mx.triu(mask, k=1)
+    if pad_mask is not None:
+      pad_mask = pad_mask[:, :, None] | pad_mask[None, :, :]
+      mask = mx.where(pad_mask, float("-inf"), mask)
+    return mask[:, None, :, :] if pad_mask is not None else mask
 
   def _random_sample(self, candidates: mx.array, logprobs: mx.array, sampler: Sampler):
     if sampler == "topk_greedy" or sampler == "greedy":
