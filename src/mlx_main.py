@@ -1,12 +1,14 @@
 import hashlib
 import time
 from pathlib import Path
-from typing import List, NamedTuple, Optional, Tuple
+from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from src.tokenizer import Tokenizer
+
+Sampler = Literal["greedy", "topk", "topp", "topk_greedy", "minp"]
 
 
 class ModelParams(NamedTuple):
@@ -287,8 +289,8 @@ class Llama:
     mask = mx.where(pad_mask, float("-inf"), mask)[:, None, :, :]
     return mask
 
-  def _random_sample(self, candidates: mx.array, logprobs: mx.array, sampler: str):
-    if sampler == "topk_greedy" or sampler == "greedy":
+  def _random_sample(self, candidates: mx.array, logprobs: mx.array, sampler: Sampler):
+    if sampler == "topk_greedy" or sampler == "greedyy":
       return candidates[:, 0].reshape(-1, 1), logprobs[:, 0]
     idx = mx.random.categorical(logprobs)
     batch_indices = mx.arange(candidates.shape[0])
@@ -301,14 +303,40 @@ class Llama:
       f"{ prompt }<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     )
 
-  def generate(self, prompts: list[str], sampler: str, temp: float, **kwargs):
-    """This function yields stream of completion chunks, just like OpenAI's."""
-    assert isinstance(prompts, list), "tokens must be a list of strings"
+  def tokenize(
+    self,
+    prompts: list[str],
+    format_instruct: bool,
+    postfix: Optional[str] = None,
+  ) -> Tuple[mx.array, mx.array]:
+    """
+    Postfix is for putting words in the assistant's mouth
+    eg. "Let's think step by step."
+    """
+    assert isinstance(prompts, list), "prompts must be a list of strings"
     encode_kwargs = {"bos": False, "eos": False, "allowed_special": "all"}
-    prompts = [self._format_instruct(p) if self.is_instruct else p for p in prompts]
+    if format_instruct and self.is_instruct:
+      prompts = [self._format_instruct(p) for p in prompts]
+    if postfix is not None:
+      prompts = [p + postfix for p in prompts]
     tokens = [mx.array(self.tokenizer.encode(p, **encode_kwargs)) for p in prompts]
     tokens, pad_mask = self._pad_batch(tokens, self.tokenizer.eos_id)
     attn_mask = self._build_attn_mask(tokens.shape[-1], pad_mask)  # type: ignore
+    return tokens, attn_mask
+
+  def detokenize(self, tokens: mx.array) -> List[str]:
+    assert len(tokens.shape) == 1, "tokens must be shape (seqlen)"
+    return self.tokenizer.decode(tokens.tolist())  # type: ignore
+
+  def generate(
+    self,
+    tokens: mx.array,
+    attn_mask: mx.array,
+    sampler: Sampler,
+    temp: float,
+    **kwargs,
+  ):
+    assert len(tokens.shape) == 2, "tokens must be shape (bsz, seqlen)"
     STOP_TOKENS = [128001, 128008, 128009]
     chat_id = hashlib.md5(str(time.time()).encode("utf-8")).hexdigest()
     cur_pos = 0
@@ -430,9 +458,9 @@ if __name__ == "__main__":
   is_instruct = True
   weight_path, tok_path = "src/model/1B", "src/tokenizer.model"
   weight_path = weight_path + "-Instruct" if is_instruct else weight_path
-  prompts = ["Explain why the meaning of life is 42."]
+  prompts = ["Which is bigger, 9.11 or 9.9?"]
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
-
-  print(f"{prompts[0]}\n")
-  for chunk in llama.generate(prompts, "topk", temp=0.6, k=5):
+  tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
+  print(llama.detokenize(tokens[0]))
+  for chunk in llama.generate(tokens, attn_mask, sampler="topk", temp=0.6, k=5):
     print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
