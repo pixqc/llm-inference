@@ -6,6 +6,7 @@ from typing import List, Literal, NamedTuple, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from src.prompt import read_prompts
 from src.tokenizer import Tokenizer
 
 Sampler = Literal["greedy", "topk", "topp", "topk_greedy", "minp"]
@@ -468,9 +469,9 @@ if __name__ == "__main__":
   is_instruct = True
   weight_path, tok_path = "src/model/1B", "src/tokenizer.model"
   weight_path = weight_path + "-Instruct" if is_instruct else weight_path
-  prompts = ["Explain WHY 1+1=2."]
+  prompts = [read_prompts("src/data/prompts.csv")[0]]
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
-  tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
+  tokens, attn_mask = llama.tokenize(prompts, format_instruct=False)
   print(llama.detokenize(tokens[0]), end="")
   for chunk in llama.generate(tokens, attn_mask, sampler="greedy", temp=0.6, k=5):
     print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
