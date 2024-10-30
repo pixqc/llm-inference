@@ -59,14 +59,13 @@ def reverse_permute(
 
 
 if __name__ == "__main__":
-  is_instruct = True
-  base_model_id = "meta-llama/Llama-3.2-1B"
-  model_id = f"{base_model_id}{'-Instruct' if is_instruct else ''}"
-  out_dir = Path(f"src/model/1B{'-Instruct' if is_instruct else ''}")
+  model_id = os.environ.get("MODEL_ID", "meta-llama/Llama-3.2-1B")
+  out_dir = Path(os.environ.get("OUT_DIR", "src/model/1B"))
   if not out_dir.exists():
     out_dir.mkdir(parents=True, exist_ok=True)
-
   token = os.environ.get("HUGGINGFACE_TOKEN")
+  if not token:
+    raise ValueError("HUGGINGFACE_TOKEN environment variable is required")
   hf_model = AutoModelForCausalLM.from_pretrained(
     model_id,
     torch_dtype=torch.bfloat16,
