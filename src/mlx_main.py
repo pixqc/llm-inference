@@ -1,6 +1,5 @@
 import hashlib
 import time
-from pathlib import Path
 from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import mlx.core as mx
@@ -182,34 +181,29 @@ class Llama:
       (lm_head): Linear(in_features=2048, out_features=128256, bias=False)
     )
     """
-    w = {}
-    layer_weights = []
-    for file in Path(dir).glob("*.npy"):
-      name = ".".join(str(file).split("/")[-1].split(".")[:-1])
-      w[name] = mx.load(str(file), "npy")
 
+    weights = mx.load(f"{dir}/model.safetensors", format="safetensors")
+    layer_weights = []
     for i in range(n_layers):
       layer_weights.append(
         LayerWeights(
-          wq=w[f"layers.{i}.attention.wq.weight"],
-          wk=w[f"layers.{i}.attention.wk.weight"],
-          wv=w[f"layers.{i}.attention.wv.weight"],
-          wo=w[f"layers.{i}.attention.wo.weight"],
-          w1=w[f"layers.{i}.feed_forward.w1.weight"],
-          w2=w[f"layers.{i}.feed_forward.w2.weight"],
-          w3=w[f"layers.{i}.feed_forward.w3.weight"],
-          ffn_norm=w[f"layers.{i}.ffn_norm.weight"],
-          attention_norm=w[f"layers.{i}.attention_norm.weight"],
+          wq=weights[f"layers.{i}.attention.wq.weight"],
+          wk=weights[f"layers.{i}.attention.wk.weight"],
+          wv=weights[f"layers.{i}.attention.wv.weight"],
+          wo=weights[f"layers.{i}.attention.wo.weight"],
+          w1=weights[f"layers.{i}.feed_forward.w1.weight"],
+          w2=weights[f"layers.{i}.feed_forward.w2.weight"],
+          w3=weights[f"layers.{i}.feed_forward.w3.weight"],
+          ffn_norm=weights[f"layers.{i}.ffn_norm.weight"],
+          attention_norm=weights[f"layers.{i}.attention_norm.weight"],
         )
       )
-
     xfmr_weights = XfmrWeights(
-      tok_embeddings=w["tok_embeddings.weight"],
-      norm=w["norm.weight"],
-      output=w["output.weight"],
+      tok_embeddings=weights["tok_embeddings.weight"],
+      norm=weights["norm.weight"],
+      output=weights["output.weight"],
       layer_weights=layer_weights,
     )
-
     return xfmr_weights
 
   def __init__(
