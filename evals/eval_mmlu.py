@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from typing import List, NamedTuple
 
-from src.mlx_main import LLAMA_1B_PARAMS, Llama
+from src.torch_main import LLAMA_1B_PARAMS, Llama
 
 
 class MMLU(NamedTuple):
@@ -44,8 +44,10 @@ if __name__ == "__main__":
   weight_path = weight_path + "-Instruct" if is_instruct else weight_path
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path)
 
+  correct, total = 0, 0
   with open("evals/eval_mmlu.jsonl", "a") as f:
     for question, answer in mmlu_zero[:10]:
+      total += 1
       tokens, attn_mask = llama.tokenize(
         [question],
         format_instruct=True,
@@ -53,9 +55,23 @@ if __name__ == "__main__":
       )
       print(llama.detokenize(tokens[0]), end="")
       for chunk in llama.generate(
-        tokens, attn_mask, sampler="topk_greedy", temp=0, k=5
+        tokens, attn_mask, sampler="topk_greedy", temp=0, k=4
       ):
         print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
-        chunk["answer"] = answer
-        f.write(json.dumps(chunk) + "\n")
+        logprobs = chunk["top_predictions"]
+        pred = chunk["choices"][0]["delta"]["content"].strip()
+        logprobs = [{"token": tp["token"], "logprob": tp["logprob"]} for tp in logprobs]
+        result = {
+          "question": question,
+          "pred": pred,
+          "ground_truth": answer,
+          "logprobs": logprobs,
+        }
+        if pred == answer:
+          correct += 1
+        f.write(json.dumps(result) + "\n")
         f.flush()
+        break
+
+  accuracy = correct / total
+  print(f"\nMMLU Accuracy: {accuracy:.2%}")
