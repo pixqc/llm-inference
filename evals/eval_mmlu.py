@@ -46,7 +46,7 @@ if __name__ == "__main__":
 
   correct, total = 0, 0
   with open("evals/eval_mmlu.jsonl", "a") as f:
-    for question, answer in mmlu_zero[:10]:
+    for question, answer in mmlu_zero:
       total += 1
       tokens, attn_mask = llama.tokenize(
         [question],
