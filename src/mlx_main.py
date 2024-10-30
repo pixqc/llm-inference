@@ -54,44 +54,38 @@ class XfmrWeights(NamedTuple):
 class Rope:
   """MLX has no complex number. freqs_cis is a tuple of sin and cos"""
 
-  def __init__(
-    self,
+  @staticmethod
+  def precompute_freqs_cis(
     dim: int,
     max_seqlen: int,
     theta: float = 500000.0,
     use_scaled: bool = True,
     dtype=mx.float32,
-  ):
-    self.dim = dim
-    self.max_seqlen = max_seqlen
-    self.theta = theta
-    self.use_scaled = use_scaled
-    self.dtype = dtype
-    self.freqs_cis = self._precompute_freqs_cis()
-
-  def _precompute_freqs_cis(self) -> tuple[mx.array, mx.array]:
-    real = lambda x: mx.view(x, self.dtype)[..., ::2]
-    imag = lambda x: mx.view(x, self.dtype)[..., 1::2]
-    freqs = 1.0 / (
-      self.theta
-      ** (mx.arange(0, self.dim, 2)[: (self.dim // 2)].astype(self.dtype) / self.dim)
-    )
-    if self.use_scaled:
-      pass  # TODO
-    t = mx.arange(self.max_seqlen, dtype=self.dtype)
+  ) -> tuple[mx.array, mx.array]:
+    real = lambda x: mx.view(x, dtype)[..., ::2]
+    imag = lambda x: mx.view(x, dtype)[..., 1::2]
+    freqs = 1.0 / (theta ** (mx.arange(0, dim, 2)[: (dim // 2)].astype(dtype) / dim))
+    if use_scaled:
+      pass  # TODO: Implement scaling if needed
+    t = mx.arange(max_seqlen, dtype=dtype)
     freqs = mx.outer(t, freqs)
     freqs = mx.exp(1j * freqs)
     return imag(freqs), real(freqs)
 
-  def get_slice(self, start: Optional[int], end: int) -> tuple[mx.array, mx.array]:
-    return self.freqs_cis[0][start:end], self.freqs_cis[1][start:end]
+  @staticmethod
+  def get_freqs_slice(
+    freqs_cis: tuple[mx.array, mx.array],
+    start: Optional[int] = None,
+    end: Optional[int] = None,
+  ) -> tuple[mx.array, mx.array]:
+    return freqs_cis[0][start:end], freqs_cis[1][start:end]
 
   @staticmethod
   def apply_rotary_emb(
     xq: mx.array,
     xk: mx.array,
     freqs_cis: tuple[mx.array, mx.array],
-  ):
+  ) -> tuple[mx.array, mx.array]:
     freqs_sin, freqs_cos = freqs_cis
     xq_r, xq_i = xq[..., ::2], xq[..., 1::2]
     xk_r, xk_i = xk[..., ::2], xk[..., 1::2]
@@ -231,11 +225,11 @@ class Llama:
     self.tokenizer = Tokenizer(tokenizer_path)
     self.xfmr = Transformer(model_params, self.weights)
     self.kvcache = KVCache.init(bsz, model_params)
-    self.rope = Rope(
-      dim=model_params.head_dim,
-      max_seqlen=model_params.max_seqlen,
-      theta=model_params.rope_theta,
-      use_scaled=model_params.use_scaled_rope,
+    self.freqs_cis_all = Rope.precompute_freqs_cis(
+      model_params.head_dim,
+      model_params.max_seqlen,
+      model_params.rope_theta,
+      model_params.use_scaled_rope,
     )
 
   def _get_candidates(
@@ -355,12 +349,11 @@ class Llama:
       if cur_pos == 0:
         x = tokens
         attn_mask = attn_mask
-        freqs_cis = self.rope.get_slice(None, tokens.shape[-1])
+        freqs_cis = Rope.get_freqs_slice(self.freqs_cis_all, None, tokens.shape[-1])
       else:
         x = tokens[:, -1:]
         attn_mask = mx.array([0])
-        freqs_cis = self.rope.get_slice(cur_pos, cur_pos + 1)
-      # should this be even a stateful class?
+        freqs_cis = Rope.get_freqs_slice(self.freqs_cis_all, cur_pos, cur_pos + 1)
       logits, self.kvcache = self.xfmr(x, self.kvcache, cur_pos, attn_mask, freqs_cis)  # type: ignore
       candidates, logprobs = self._get_candidates(logits, sampler, temp=temp, **kwargs)
       next_token, _ = self._random_sample(candidates, logprobs, sampler)
@@ -479,5 +472,5 @@ if __name__ == "__main__":
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]), end="")
-  for chunk in llama.generate(tokens, attn_mask, sampler="topk", temp=0.6, k=5):
+  for chunk in llama.generate(tokens, attn_mask, sampler="greedy", temp=0.6, k=5):
     print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
