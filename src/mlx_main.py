@@ -52,6 +52,8 @@ class XfmrWeights(NamedTuple):
 
 
 class Rope:
+  """MLX has no complex number. freqs_cis is a tuple of sin and cos"""
+
   def __init__(
     self,
     dim: int,
@@ -65,9 +67,9 @@ class Rope:
     self.theta = theta
     self.use_scaled = use_scaled
     self.dtype = dtype
-    self.freqs_sin, self.freqs_cos = self._precompute_freqs_cis()
+    self.freqs_cis = self._precompute_freqs_cis()
 
-  def _precompute_freqs_cis(self):
+  def _precompute_freqs_cis(self) -> tuple[mx.array, mx.array]:
     real = lambda x: mx.view(x, self.dtype)[..., ::2]
     imag = lambda x: mx.view(x, self.dtype)[..., 1::2]
     freqs = 1.0 / (
@@ -75,20 +77,22 @@ class Rope:
       ** (mx.arange(0, self.dim, 2)[: (self.dim // 2)].astype(self.dtype) / self.dim)
     )
     if self.use_scaled:
-      pass  # No scaling implemented yet
+      pass  # TODO
     t = mx.arange(self.max_seqlen, dtype=self.dtype)
     freqs = mx.outer(t, freqs)
     freqs = mx.exp(1j * freqs)
     return imag(freqs), real(freqs)
 
-  # TODO: why is there a seqlen here
-  def apply_rotary_emb(self, xq, xk, start_pos: int, seqlen: Optional[int] = None):
-    if seqlen is None:
-      freqs_sin = self.freqs_sin[start_pos : start_pos + 1]
-      freqs_cos = self.freqs_cos[start_pos : start_pos + 1]
-    else:
-      freqs_sin = self.freqs_sin[:seqlen]
-      freqs_cos = self.freqs_cos[:seqlen]
+  def get_slice(self, start: Optional[int], end: int) -> tuple[mx.array, mx.array]:
+    return self.freqs_cis[0][start:end], self.freqs_cis[1][start:end]
+
+  @staticmethod
+  def apply_rotary_emb(
+    xq: mx.array,
+    xk: mx.array,
+    freqs_cis: tuple[mx.array, mx.array],
+  ):
+    freqs_sin, freqs_cos = freqs_cis
     xq_r, xq_i = xq[..., ::2], xq[..., 1::2]
     xk_r, xk_i = xk[..., ::2], xk[..., 1::2]
     freqs_sin = freqs_sin[None, :, None, :]
@@ -227,6 +231,12 @@ class Llama:
     self.tokenizer = Tokenizer(tokenizer_path)
     self.xfmr = Transformer(model_params, self.weights)
     self.kvcache = KVCache.init(bsz, model_params)
+    self.rope = Rope(
+      dim=model_params.head_dim,
+      max_seqlen=model_params.max_seqlen,
+      theta=model_params.rope_theta,
+      use_scaled=model_params.use_scaled_rope,
+    )
 
   def _get_candidates(
     self, logits: mx.array, _type: str, temp=0.7, **kwargs
@@ -290,7 +300,7 @@ class Llama:
     return mask
 
   def _random_sample(self, candidates: mx.array, logprobs: mx.array, sampler: Sampler):
-    if sampler == "topk_greedy" or sampler == "greedyy":
+    if sampler == "topk_greedy" or sampler == "greedy":
       return candidates[:, 0].reshape(-1, 1), logprobs[:, 0]
     idx = mx.random.categorical(logprobs)
     batch_indices = mx.arange(candidates.shape[0])
@@ -342,9 +352,16 @@ class Llama:
     cur_pos = 0
 
     while cur_pos < self.params.max_seqlen:
-      x = tokens if cur_pos == 0 else tokens[:, -1:]
-      attn_mask = attn_mask if cur_pos == 0 else mx.array([0])
-      logits, self.kvcache = self.xfmr(x, self.kvcache, cur_pos, attn_mask)  # type: ignore
+      if cur_pos == 0:
+        x = tokens
+        attn_mask = attn_mask
+        freqs_cis = self.rope.get_slice(None, tokens.shape[-1])
+      else:
+        x = tokens[:, -1:]
+        attn_mask = mx.array([0])
+        freqs_cis = self.rope.get_slice(cur_pos, cur_pos + 1)
+      # should this be even a stateful class?
+      logits, self.kvcache = self.xfmr(x, self.kvcache, cur_pos, attn_mask, freqs_cis)  # type: ignore
       candidates, logprobs = self._get_candidates(logits, sampler, temp=temp, **kwargs)
       next_token, _ = self._random_sample(candidates, logprobs, sampler)
       is_stop = next_token[0] in STOP_TOKENS
@@ -388,13 +405,13 @@ class AttentionBlock:
   def __call__(
     self,
     x: mx.array,
-    rope: Rope,
     kvcache: KVCache,
     cur_pos: int,
     mask: mx.array,
+    freqs_cis: tuple[mx.array, mx.array],
   ):
     x = mx.fast.rms_norm(x, self.weights.attention_norm, 1e-6)
-    bsz, seqlen, _ = x.shape
+    bsz, _, _ = x.shape
     hc, hsz, gsz = (
       self.params.n_local_heads,
       self.params.head_dim,
@@ -403,7 +420,7 @@ class AttentionBlock:
     xq = (x @ self.weights.wq.T).reshape(bsz, -1, hc, hsz)
     xk = (x @ self.weights.wk.T).reshape(bsz, -1, gsz, hsz)
     xv = (x @ self.weights.wv.T).reshape(bsz, -1, gsz, hsz)
-    xq, xk = rope.apply_rotary_emb(xq, xk, cur_pos, seqlen if cur_pos == 0 else None)
+    xq, xk = Rope.apply_rotary_emb(xq, xk, freqs_cis)
     xk, xv, kvcache = kvcache.update(self.idx, bsz, cur_pos, xk, xv, hc // gsz)
     scores = mx.einsum("bihd,bjhd->bhij", xq, xk)
     scores = (scores + mask) / mx.sqrt(mx.array(hsz))
@@ -423,19 +440,18 @@ class Transformer:
   def __init__(self, model_params: ModelParams, weights: XfmrWeights):
     self.params = model_params
     self.weights = weights
-    self.rope = Rope(
-      dim=model_params.head_dim,
-      max_seqlen=model_params.max_seqlen,
-      theta=model_params.rope_theta,
-      use_scaled=model_params.use_scaled_rope,
-    )
     self.attns = [
       AttentionBlock(i, model_params, layer_weights)
       for i, layer_weights in enumerate(self.weights.layer_weights)
     ]
 
   def __call__(
-    self, tokens: mx.array, kvcache: KVCache, cur_pos: int, attn_mask: mx.array
+    self,
+    tokens: mx.array,
+    kvcache: KVCache,
+    cur_pos: int,
+    attn_mask: mx.array,
+    freqs_cis: tuple[mx.array, mx.array],
   ):
     x = self.weights.tok_embeddings[tokens]
     x = x[None, :] if len(x.shape) < 3 else x
@@ -443,10 +459,10 @@ class Transformer:
     for i in range(self.params.n_layers):
       attn_out, kvcache = self.attns[i](
         x,
-        self.rope,
         kvcache,
         cur_pos,
         attn_mask,
+        freqs_cis,
       )
       x = x + attn_out
       x = x + self._ffw(x, self.weights.layer_weights[i])
@@ -459,9 +475,9 @@ if __name__ == "__main__":
   is_instruct = True
   weight_path, tok_path = "src/model/1B", "src/tokenizer.model"
   weight_path = weight_path + "-Instruct" if is_instruct else weight_path
-  prompts = ["What is the capital of France?"]
+  prompts = ["Explain WHY 1+1=2."]
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
-  print(llama.detokenize(tokens[0]))
+  print(llama.detokenize(tokens[0]), end="")
   for chunk in llama.generate(tokens, attn_mask, sampler="topk", temp=0.6, k=5):
     print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
