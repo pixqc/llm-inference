@@ -2,9 +2,8 @@
 import os
 from pathlib import Path
 
-import jax.numpy as jnp
-import ml_dtypes
 import torch
+from safetensors.torch import save_file
 from transformers import AutoModelForCausalLM
 
 
@@ -76,16 +75,14 @@ if __name__ == "__main__":
   )
   with torch.no_grad():
     state_dict = hf_model.state_dict()
+    weights = {}
     for hf_name, param in state_dict.items():
       print(f" {hf_name}: {param.shape=}")
       name = translate_key(hf_name)
+      param = param.clone()
       if name.endswith("wq.weight"):
         param = reverse_permute(param, n_heads=32, dim1=2048, dim2=2048)
       elif name.endswith("wk.weight"):
         param = reverse_permute(param, n_heads=8, dim1=512, dim2=2048)
-      bf16_np_out = (
-        param.cpu().view(dtype=torch.uint16).numpy().view(ml_dtypes.bfloat16)
-      )
-      bf16_out = jnp.asarray(bf16_np_out, dtype=jnp.bfloat16).reshape(*param.shape)
-      print(f"Writing {hf_name} as {name} to {out_dir}/{name}.npy")
-      jnp.save(f"{out_dir}/{name}.npy", bf16_out)
+      weights[name] = param
+    save_file(weights, f"{out_dir}/model.safetensors")

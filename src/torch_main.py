@@ -1,12 +1,10 @@
 import hashlib
 import time
-from pathlib import Path
 from typing import List, Literal, NamedTuple, Optional, Tuple
 
-import jax.numpy as jnp
-import numpy as np
 import torch
 import torch.nn.functional as F
+from safetensors.torch import load_file
 
 from src.tokenizer import Tokenizer
 
@@ -194,34 +192,26 @@ class Llama:
       (lm_head): Linear(in_features=2048, out_features=128256, bias=False)
     )
     """
-    w = {}
+    weights = load_file(f"{dir}/model.safetensors")
     layer_weights = []
-    for file in Path(dir).glob("*.npy"):
-      name = ".".join(str(file).split("/")[-1].split(".")[:-1])
-      jax_weight = jnp.load(file=file, mmap_mode="r", allow_pickle=True)
-      np_weight = np.array(jax_weight).astype(np.float32)
-      weight = torch.from_numpy(np_weight).to(torch.bfloat16).to(device)
-      w[name] = weight.to(device)
-
     for i in range(n_layers):
       layer_weights.append(
         LayerWeights(
-          wq=w[f"layers.{i}.attention.wq.weight"],
-          wk=w[f"layers.{i}.attention.wk.weight"],
-          wv=w[f"layers.{i}.attention.wv.weight"],
-          wo=w[f"layers.{i}.attention.wo.weight"],
-          w1=w[f"layers.{i}.feed_forward.w1.weight"],
-          w2=w[f"layers.{i}.feed_forward.w2.weight"],
-          w3=w[f"layers.{i}.feed_forward.w3.weight"],
-          ffn_norm=w[f"layers.{i}.ffn_norm.weight"],
-          attention_norm=w[f"layers.{i}.attention_norm.weight"],
+          wq=weights[f"layers.{i}.attention.wq.weight"].to(device),
+          wk=weights[f"layers.{i}.attention.wk.weight"].to(device),
+          wv=weights[f"layers.{i}.attention.wv.weight"].to(device),
+          wo=weights[f"layers.{i}.attention.wo.weight"].to(device),
+          w1=weights[f"layers.{i}.feed_forward.w1.weight"].to(device),
+          w2=weights[f"layers.{i}.feed_forward.w2.weight"].to(device),
+          w3=weights[f"layers.{i}.feed_forward.w3.weight"].to(device),
+          ffn_norm=weights[f"layers.{i}.ffn_norm.weight"].to(device),
+          attention_norm=weights[f"layers.{i}.attention_norm.weight"].to(device),
         )
       )
-
     xfmr_weights = XfmrWeights(
-      tok_embeddings=w["tok_embeddings.weight"],
-      norm=w["norm.weight"],
-      output=w["output.weight"],
+      tok_embeddings=weights["tok_embeddings.weight"].to(device),
+      norm=weights["norm.weight"].to(device),
+      output=weights["output.weight"].to(device),
       layer_weights=layer_weights,
     )
 
@@ -489,7 +479,7 @@ if __name__ == "__main__":
   is_instruct = True
   weight_path, tok_path = "src/model/1B", "src/tokenizer.model"
   weight_path = weight_path + "-Instruct" if is_instruct else weight_path
-  prompts = ["Can you explain WHY 1+1=2?"]
+  prompts = ["What is Alzheimer's disease?"]
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]))
