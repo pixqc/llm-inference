@@ -1,4 +1,8 @@
 #!/bin/bash
+
+# once ssh'd into box
+# git clone https://github.com/pixqc/llm-inference.git && mv llm-inference/* llm-inference/.* . 2>/dev/null && rmdir llm-inference
+
 set -e
 export HUGGINGFACE_TOKEN=""
 if [ -z "$HUGGINGFACE_TOKEN" ]; then
@@ -16,14 +20,8 @@ pip install -U \
 PYTHONPATH='.' MODEL_ID=meta-llama/Llama-3.2-1B OUT_DIR=src/model/1B python3 src/download_model.py
 PYTHONPATH='.' MODEL_ID=meta-llama/Llama-3.2-1B-Instruct OUT_DIR=src/model/1B-Instruct python3 src/download_model.py
 
-mkdir -p evals/mmlu
-curl -L https://people.eecs.berkeley.edu/~hendrycks/data.tar -o /tmp/data.tar
-tar xf /tmp/data.tar -C /tmp
-mv /tmp/data/* evals/mmlu/
-rm -rf /tmp/data
+mkdir -p evals/mmlu evals/math
+curl -L https://people.eecs.berkeley.edu/~hendrycks/data.tar | tar x --no-same-owner -C evals/mmlu
+curl -L https://people.eecs.berkeley.edu/~hendrycks/MATH.tar | tar x --no-same-owner -C evals/math
 
-mkdir -p evals/math
-curl -L https://people.eecs.berkeley.edu/~hendrycks/MATH.tar -o /tmp/MATH.tar
-tar xf /tmp/MATH.tar -C /tmp
-mv /tmp/MATH/* evals/math/
-rm -rf /tmp/MATH
+PYTHONPATH='.' python3 src/torch_main.py  # test the inference
