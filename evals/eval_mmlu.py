@@ -30,14 +30,14 @@ def format_q(mmlu: MMLU) -> str:
   )
 
 
-def format_qa(mmlu: MMLU) -> str:
-  return format_q(mmlu) + f" {chr(mmlu.answer + ord('A'))}.<|eot_id|>"
+def format_qa(mmlu: MMLU) -> tuple[str, str]:
+  return (format_q(mmlu), chr(mmlu.answer + ord("A")))
 
 
 if __name__ == "__main__":
   MMLU_DIR = Path("evals/mmlu/test")
   mmlu = read_mmlu(MMLU_DIR)
-  mmlu_zero = [format_q(data) for data in mmlu]
+  mmlu_zero = [format_qa(data) for data in mmlu]
 
   is_instruct = True
   weight_path, tok_path = "src/model/1B", "src/tokenizer.model"
@@ -45,7 +45,7 @@ if __name__ == "__main__":
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path)
 
   with open("evals/eval_mmlu.jsonl", "a") as f:
-    for question in mmlu_zero[:10]:
+    for question, answer in mmlu_zero[:10]:
       tokens, attn_mask = llama.tokenize(
         [question],
         format_instruct=True,
@@ -56,4 +56,6 @@ if __name__ == "__main__":
         tokens, attn_mask, sampler="topk_greedy", temp=0, k=5
       ):
         print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
+        chunk["answer"] = answer
         f.write(json.dumps(chunk) + "\n")
+        f.flush()
