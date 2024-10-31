@@ -14,8 +14,7 @@ elif torch.cuda.is_available():
   device = torch.device("cuda")
 else:
   device = torch.device("cpu")
-
-print(f"Using device: {device}")
+print(f"using device: {device}")
 
 Sampler = Literal["greedy", "topk", "topp", "topk_greedy", "minp"]
 
@@ -194,26 +193,26 @@ class Llama:
       (lm_head): Linear(in_features=2048, out_features=128256, bias=False)
     )
     """
-    weights = load_file(f"{dir}/model.safetensors")
+    weights = load_file(f"{dir}/model.safetensors", device=str(device))
     layer_weights = []
     for i in range(n_layers):
       layer_weights.append(
         LayerWeights(
-          wq=weights[f"layers.{i}.attention.wq.weight"].to(device),
-          wk=weights[f"layers.{i}.attention.wk.weight"].to(device),
-          wv=weights[f"layers.{i}.attention.wv.weight"].to(device),
-          wo=weights[f"layers.{i}.attention.wo.weight"].to(device),
-          w1=weights[f"layers.{i}.feed_forward.w1.weight"].to(device),
-          w2=weights[f"layers.{i}.feed_forward.w2.weight"].to(device),
-          w3=weights[f"layers.{i}.feed_forward.w3.weight"].to(device),
-          ffn_norm=weights[f"layers.{i}.ffn_norm.weight"].to(device),
-          attention_norm=weights[f"layers.{i}.attention_norm.weight"].to(device),
+          wq=weights[f"layers.{i}.attention.wq.weight"],
+          wk=weights[f"layers.{i}.attention.wk.weight"],
+          wv=weights[f"layers.{i}.attention.wv.weight"],
+          wo=weights[f"layers.{i}.attention.wo.weight"],
+          w1=weights[f"layers.{i}.feed_forward.w1.weight"],
+          w2=weights[f"layers.{i}.feed_forward.w2.weight"],
+          w3=weights[f"layers.{i}.feed_forward.w3.weight"],
+          ffn_norm=weights[f"layers.{i}.ffn_norm.weight"],
+          attention_norm=weights[f"layers.{i}.attention_norm.weight"],
         )
       )
     xfmr_weights = XfmrWeights(
-      tok_embeddings=weights["tok_embeddings.weight"].to(device),
-      norm=weights["norm.weight"].to(device),
-      output=weights["output.weight"].to(device),
+      tok_embeddings=weights["tok_embeddings.weight"],
+      norm=weights["norm.weight"],
+      output=weights["output.weight"],
       layer_weights=layer_weights,
     )
 
@@ -352,6 +351,7 @@ class Llama:
     assert len(tokens.shape) == 1, "tokens must be shape (seqlen)"
     return self.tokenizer.decode(tokens.tolist())  # type: ignore
 
+  @torch.no_grad()
   def generate(
     self,
     tokens: torch.Tensor,
@@ -368,11 +368,11 @@ class Llama:
       if cur_pos == 0:
         x = tokens
         attn_mask = attn_mask
-        freqs_cis = Rope.get_freqs_slice(self.freqs_cis_all, None, tokens.shape[-1])
+        freqs_cis = self.freqs_cis_all[None, tokens.shape[-1]]
       else:
         x = tokens[:, -1:]
         attn_mask = torch.tensor([0]).to(device=device)
-        freqs_cis = Rope.get_freqs_slice(self.freqs_cis_all, cur_pos, cur_pos + 1)
+        freqs_cis = self.freqs_cis_all[cur_pos : cur_pos + 1]
       logits, self.kvcache = self.xfmr(x, self.kvcache, cur_pos, attn_mask, freqs_cis)  # type: ignore
       candidates, logprobs = self._get_candidates(logits, sampler, temp=temp, **kwargs)
       next_token, _ = self._random_sample(candidates, logprobs, sampler)
