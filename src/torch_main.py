@@ -66,7 +66,7 @@ class Rope:
     max_seqlen: int,
     theta: float = 500000.0,
     use_scaled: bool = True,
-    dtype=torch.float32,
+    dtype=torch.bfloat16,
   ) -> torch.Tensor:
     freqs = 1.0 / (
       theta ** (torch.arange(0, dim, 2, dtype=dtype, device=device)[: (dim // 2)] / dim)
@@ -77,14 +77,6 @@ class Rope:
     freqs = freqs.unsqueeze(0)
     freqs = t * freqs
     return torch.exp(1j * freqs)
-
-  @staticmethod
-  def get_freqs_slice(
-    freqs_cis: torch.Tensor,
-    start: Optional[int] = None,
-    end: Optional[int] = None,
-  ) -> torch.Tensor:
-    return freqs_cis[start:end]
 
   @staticmethod
   def apply_rotary_emb(
@@ -193,26 +185,26 @@ class Llama:
       (lm_head): Linear(in_features=2048, out_features=128256, bias=False)
     )
     """
-    weights = load_file(f"{dir}/model.safetensors", device=str(device))
+    weights = load_file(f"{dir}/model.safetensors")
     layer_weights = []
     for i in range(n_layers):
       layer_weights.append(
         LayerWeights(
-          wq=weights[f"layers.{i}.attention.wq.weight"],
-          wk=weights[f"layers.{i}.attention.wk.weight"],
-          wv=weights[f"layers.{i}.attention.wv.weight"],
-          wo=weights[f"layers.{i}.attention.wo.weight"],
-          w1=weights[f"layers.{i}.feed_forward.w1.weight"],
-          w2=weights[f"layers.{i}.feed_forward.w2.weight"],
-          w3=weights[f"layers.{i}.feed_forward.w3.weight"],
-          ffn_norm=weights[f"layers.{i}.ffn_norm.weight"],
-          attention_norm=weights[f"layers.{i}.attention_norm.weight"],
+          wq=weights[f"layers.{i}.attention.wq.weight"].to(device),
+          wk=weights[f"layers.{i}.attention.wk.weight"].to(device),
+          wv=weights[f"layers.{i}.attention.wv.weight"].to(device),
+          wo=weights[f"layers.{i}.attention.wo.weight"].to(device),
+          w1=weights[f"layers.{i}.feed_forward.w1.weight"].to(device),
+          w2=weights[f"layers.{i}.feed_forward.w2.weight"].to(device),
+          w3=weights[f"layers.{i}.feed_forward.w3.weight"].to(device),
+          ffn_norm=weights[f"layers.{i}.ffn_norm.weight"].to(device),
+          attention_norm=weights[f"layers.{i}.attention_norm.weight"].to(device),
         )
       )
     xfmr_weights = XfmrWeights(
-      tok_embeddings=weights["tok_embeddings.weight"],
-      norm=weights["norm.weight"],
-      output=weights["output.weight"],
+      tok_embeddings=weights["tok_embeddings.weight"].to(device),
+      norm=weights["norm.weight"].to(device),
+      output=weights["output.weight"].to(device),
       layer_weights=layer_weights,
     )
 
@@ -298,8 +290,8 @@ class Llama:
     mask = torch.triu(mask, diagonal=1)
     if pad_mask is not None:
       pad_mask = pad_mask[:, :, None] | pad_mask[None, :, :]
-      mask = torch.where(pad_mask, float("-inf"), mask)[:, None, :, :]
-    return mask
+      mask = torch.where(pad_mask, float("-inf"), mask)
+    return mask[:, None, :, :] if pad_mask is not None else mask
 
   def _random_sample(
     self, candidates: torch.Tensor, logprobs: torch.Tensor, sampler: str
@@ -343,7 +335,6 @@ class Llama:
     assert len(tokens.shape) == 1, "tokens must be shape (seqlen)"
     return self.tokenizer.decode(tokens.tolist())  # type: ignore
 
-  @torch.no_grad()
   def generate(
     self,
     tokens: torch.Tensor,
@@ -360,7 +351,7 @@ class Llama:
       if cur_pos == 0:
         x = tokens
         attn_mask = attn_mask
-        freqs_cis = self.freqs_cis_all[None, tokens.shape[-1]]
+        freqs_cis = self.freqs_cis_all[: tokens.shape[-1]]
       else:
         x = tokens[:, -1:]
         attn_mask = torch.tensor([0]).to(device=device)
@@ -477,5 +468,5 @@ if __name__ == "__main__":
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]))
-  for chunk in llama.generate(tokens, attn_mask, sampler="topk", temp=0.6, k=5):
+  for chunk in llama.generate(tokens, attn_mask, sampler="greedy", temp=0.6, k=5):
     print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
