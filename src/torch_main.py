@@ -290,8 +290,8 @@ class Llama:
     mask = torch.triu(mask, diagonal=1)
     if pad_mask is not None:
       pad_mask = pad_mask[:, :, None] | pad_mask[None, :, :]
-      mask = torch.where(pad_mask, float("-inf"), mask)
-    return mask[:, None, :, :] if pad_mask is not None else mask
+      mask = torch.where(pad_mask, float("-inf"), mask)[:, None, :, :]
+    return mask
 
   def _random_sample(
     self, candidates: torch.Tensor, logprobs: torch.Tensor, sampler: str
