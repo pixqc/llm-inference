@@ -1,9 +1,10 @@
 import csv
-import json
 from pathlib import Path
-from typing import Iterator, List, NamedTuple, Optional
+from typing import Iterator, List, NamedTuple
 
-from src.torch_main import LLAMA_1B_PARAMS, Llama
+import torch
+
+from src.torch_main import LLAMA_1B_PARAMS, Llama, device
 
 
 class MMLU(NamedTuple):
@@ -11,14 +12,41 @@ class MMLU(NamedTuple):
   choices: List[str]
   answer: int
 
-  def format(self) -> tuple[str, str]:
-    prompt = (
-      "Given the following question and four candidate answers (A, B, C and D), choose the best answer."
-      f"\nQuestion: {self.question}\n"
+  def prompt_template(self) -> str:
+    return (
+      "Given the following question and four candidate answers (A, B, C and D), choose the best answer.\n"
+      f"Question: {self.question}\n"
       + "\n".join(f"{c}. {a}" for c, a in zip("ABCD", self.choices))
       + '\nYour response should end with "The best answer is [the_answer_letter]" where the [the_answer_letter] is one of A, B, C or D.'
     )
-    return prompt, chr(self.answer + ord("A"))
+
+  def format_instruct_qa(self) -> str:
+    prompt = self.prompt_template()
+    answer = chr(self.answer + ord("A"))
+    return (
+      f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
+      f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+      f"The best answer is {answer}.<|eot_id|>"
+    )
+
+  def format_instruct_q(self) -> str:
+    prompt = self.prompt_template()
+    return (
+      "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n<|eot_id|>"
+      f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
+      f"<|start_header_id|>assistant<|end_header_id|>\n\n"
+      f"The best answer is"
+    )
+
+
+def format_fewshot(
+  examples: List[MMLU],
+  question: MMLU,
+) -> str:
+  prompt = []
+  prompt.extend(ex.format_instruct_qa() for ex in examples)
+  prompt.append(question.format_instruct_q())
+  return "".join(prompt)
 
 
 def load_mmlu(path: Path) -> Iterator[MMLU]:
@@ -30,45 +58,38 @@ def load_mmlu(path: Path) -> Iterator[MMLU]:
   )
 
 
-def format_fewshot(question: str, examples: Optional[List[tuple[str, str]]]) -> str:
-  if examples:
-    examples_text = "\n\n".join(f"{q}\nThe best answer is {a}." for q, a in examples)
-    return f"{examples_text}\n\n{question}"
-  return question
-
-
 if __name__ == "__main__":
-  fewshot = [ex.format() for ex in list(load_mmlu(Path("evals/mmlu/val")))[:2]]
-  mmlu = [ex.format() for ex in load_mmlu(Path("evals/mmlu/test"))]
-
+  SYSTEM_PROMPT = (
+    "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n<|eot_id|>"
+  )
+  fewshot = list(load_mmlu(Path("evals/mmlu/val")))[:2]
+  mmlu = list(load_mmlu(Path("evals/mmlu/test")))
   is_instruct = True
   weight_path = f"src/model/1B{'-Instruct' if is_instruct else ''}"
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, "src/tokenizer.model")
-
   correct = total = 0
-  with open("evals/eval_mmlu.jsonl", "a") as f:
-    for question, answer in mmlu:
-      total += 1
-      prompt = format_fewshot(question, fewshot)
-      tokens, attn_mask = llama.tokenize(
-        [prompt], format_instruct=True, postfix="The best answer is"
-      )
-      print(llama.detokenize(tokens[0]), end="")
-      for chunk in llama.generate(
-        tokens, attn_mask, sampler="topk_greedy", temp=0, k=4
-      ):
-        pred = chunk["choices"][0]["delta"]["content"].strip()
-        print(f"({pred},{answer})", end="", flush=True)
-        result = {
-          "prompt": prompt,
-          "pred": pred,
-          "answer": answer,
-          "logprobs": [
-            {"token": tp["token"], "logprob": tp["logprob"]}
-            for tp in chunk["top_predictions"]
-          ],
-        }
-        correct += pred == answer
-        f.write(f"{json.dumps(result)}\n")
-        break
-  print(f"\nMMLU Accuracy: {correct/total:.2%}")
+  encode_kwargs = {"bos": False, "eos": False, "allowed_special": "all"}
+  for mmlu_item in mmlu:
+    total += 1
+    prompt = SYSTEM_PROMPT + format_fewshot(fewshot, mmlu_item)
+    # prompt = SYSTEM_PROMPT + mmlu_item.format_instruct_q()
+    tokens = llama.tokenizer.encode(prompt, **encode_kwargs)
+    tokens = torch.tensor(tokens, device=device).reshape(1, -1)
+    attn_mask = llama._build_attn_mask(len(tokens), None)
+    print(llama.tokenizer.decode(tokens[0].tolist()), end="")
+    for chunk in llama.generate(tokens, attn_mask, sampler="topk_greedy", temp=0, k=4):
+      pred = chunk["choices"][0]["delta"]["content"].strip()
+      answer = chr(mmlu_item.answer + ord("A"))
+      print(f"({pred},{answer})", end="", flush=True)
+      result = {
+        "prompt": prompt,
+        "pred": pred,
+        "answer": answer,
+        "logprobs": [
+          {"token": tp["token"], "logprob": tp["logprob"]}
+          for tp in chunk["top_predictions"]
+        ],
+      }
+      correct += pred == answer
+      break
+  print(f"Accuracy: {correct}/{total} = {correct / total:.2%}")
