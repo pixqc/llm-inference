@@ -141,11 +141,11 @@ class KVCache(NamedTuple):
     n_rep: int,
   ):
     if cur_pos == 0:
-      self.k[layer_idx, :bsz, : xk.shape[1]] = xk.to(device)
-      self.v[layer_idx, :bsz, : xv.shape[1]] = xv.to(device)
+      self.k[layer_idx, :bsz, : xk.shape[1]].copy_(xk.to(device))
+      self.v[layer_idx, :bsz, : xv.shape[1]].copy_(xv.to(device))
     else:
-      self.k[layer_idx, :bsz, cur_pos - 1] = xk.squeeze(1).to(device)
-      self.v[layer_idx, :bsz, cur_pos - 1] = xv.squeeze(1).to(device)
+      self.k[layer_idx, :bsz, cur_pos - 1].copy_(xk.squeeze(1).to(device))
+      self.v[layer_idx, :bsz, cur_pos - 1].copy_(xv.squeeze(1).to(device))
       xk = self.k[layer_idx, :bsz, :cur_pos]
       xv = self.v[layer_idx, :bsz, :cur_pos]
     xk = xk.repeat_interleave(n_rep, dim=2)
