@@ -57,9 +57,9 @@ if __name__ == "__main__":
       for chunk in llama.generate(
         tokens, attn_mask, sampler="topk_greedy", temp=0, k=4
       ):
-        print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
-        logprobs = chunk["top_predictions"]
         pred = chunk["choices"][0]["delta"]["content"].strip()
+        print(f"({pred},{answer})", end="", flush=True)
+        logprobs = chunk["top_predictions"]
         logprobs = [{"token": tp["token"], "logprob": tp["logprob"]} for tp in logprobs]
         result = {
           "question": question,
