@@ -271,7 +271,7 @@ class Llama:
     logprobs = logprobs - torch.logsumexp(logprobs, dim=-1, keepdim=True)
     return candidates, logprobs
 
-  def _pad_batch(self, batch_tokens: List[torch.Tensor], pad_id: int) -> torch.Tensor:
+  def _pad_batch(self, batch_tokens: List[torch.Tensor], pad_id: int):
     longest_seqlen = max(len(tokens) for tokens in batch_tokens)
     padded_tokens = []
     for tokens in batch_tokens:
