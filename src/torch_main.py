@@ -66,7 +66,7 @@ class Rope:
     max_seqlen: int,
     theta: float = 500000.0,
     use_scaled: bool = True,
-    dtype=torch.bfloat16,
+    dtype=torch.float32,
   ) -> torch.Tensor:
     freqs = 1.0 / (
       theta ** (torch.arange(0, dim, 2, dtype=dtype, device=device)[: (dim // 2)] / dim)
