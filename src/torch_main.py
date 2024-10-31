@@ -66,7 +66,7 @@ class Rope:
     max_seqlen: int,
     theta: float = 500000.0,
     use_scaled: bool = True,
-    dtype=torch.bfloat16,
+    dtype=torch.float32,
   ) -> torch.Tensor:
     freqs = 1.0 / (
       theta ** (torch.arange(0, dim, 2, dtype=dtype, device=device)[: (dim // 2)] / dim)
@@ -279,7 +279,7 @@ class Llama:
     logprobs = logprobs - torch.logsumexp(logprobs, dim=-1, keepdim=True)
     return candidates, logprobs
 
-  def _pad_batch(self, batch_tokens: List[torch.Tensor], pad_id: int):
+  def _pad_batch(self, batch_tokens: List[torch.Tensor], pad_id: int) -> torch.Tensor:
     longest_seqlen = max(len(tokens) for tokens in batch_tokens)
     padded_tokens = []
     for tokens in batch_tokens:
@@ -294,12 +294,12 @@ class Llama:
     return padded, (padded == pad_id).to(device=device)
 
   def _build_attn_mask(self, seqlen: int, pad_mask: Optional[torch.Tensor]):
-    mask = torch.full((seqlen, seqlen), float("-inf"))
+    mask = torch.full((seqlen, seqlen), float("-inf"), device=device)
     mask = torch.triu(mask, diagonal=1)
     if pad_mask is not None:
       pad_mask = pad_mask[:, :, None] | pad_mask[None, :, :]
-      mask = torch.where(pad_mask, float("-inf"), mask)
-    return mask[:, None, :, :] if pad_mask is not None else mask
+      mask = torch.where(pad_mask, float("-inf"), mask)[:, None, :, :]
+    return mask
 
   def _random_sample(
     self, candidates: torch.Tensor, logprobs: torch.Tensor, sampler: str
