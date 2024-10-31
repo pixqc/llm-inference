@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # once ssh'd into box
-# git clone https://github.com/pixqc/llm-inference.git && mv llm-inference/* llm-inference/.* . 2>/dev/null && rmdir llm-inference
+# git clone https://github.com/pixqc/llm-inference.git && mv llm-inference/* llm-inference/.* . 2>/dev/null && rm -r llm-inference
 
 set -e
 export HUGGINGFACE_TOKEN=""
@@ -22,11 +22,9 @@ PYTHONPATH='.' MODEL_ID=meta-llama/Llama-3.2-1B-Instruct OUT_DIR=src/model/1B-In
 
 mkdir -p evals/mmlu evals/math
 curl -L https://people.eecs.berkeley.edu/~hendrycks/data.tar | tar x --no-same-owner -C evals/mmlu
-mv evals/mmlu/data/* evals/mmlu/
-rmdir evals/mmlu/data
+mv evals/mmlu/data/* evals/mmlu/ && rm -r evals/mmlu/data
 
 curl -L https://people.eecs.berkeley.edu/~hendrycks/MATH.tar | tar x --no-same-owner -C evals/math
-mv evals/math/MATH/* evals/math/
-rmdir evals/math/MATH
+mv evals/math/MATH/* evals/math/ && rm -r evals/math/MATH
 
 PYTHONPATH='.' python3 src/torch_main.py  # test the inference
