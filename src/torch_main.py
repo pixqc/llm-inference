@@ -8,12 +8,11 @@ from safetensors.torch import load_file
 
 from src.tokenizer import Tokenizer
 
+device = torch.device("cpu")
 if torch.backends.mps.is_available():
   device = torch.device("mps")
 elif torch.cuda.is_available():
   device = torch.device("cuda")
-else:
-  device = torch.device("cpu")
 print(f"using device: {device}")
 
 Sampler = Literal["greedy", "topk", "topp", "topk_greedy", "minp"]
