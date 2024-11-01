@@ -412,12 +412,12 @@ class AttentionBlock:
     xv = (x @ self.weights.wv.T).reshape(bsz, -1, gsz, hsz)
     xq, xk = Rope.apply_rotary_emb(xq, xk, freqs_cis)
     xk, xv, kvcache = kvcache.update(self.idx, bsz, cur_pos, xk, xv, hc // gsz)
-    scores = torch.einsum("bihd,bjhd->bhij", xq, xk)
-    scores = (scores + mask) / (hsz**0.5)
+    _scores = torch.einsum("bihd,bjhd->bhij", xq, xk) / (hsz**0.5)
+    scores = _scores + mask
     scores = F.softmax(scores, dim=-1).to(torch.bfloat16)
     out = torch.einsum("bhij,bjhk->bihk", scores, xv)
     out = out.reshape(out.shape[0], out.shape[1], -1)
-    return out @ self.weights.wo.T, kvcache
+    return out @ self.weights.wo.T, kvcache, _scores
 
 
 class Transformer:
@@ -445,7 +445,7 @@ class Transformer:
     x = x[None, :] if len(x.shape) < 3 else x
 
     for i in range(self.params.n_layers):
-      attn_out, kvcache = self.attns[i](
+      attn_out, kvcache, _ = self.attns[i](
         x,
         kvcache,
         cur_pos,
