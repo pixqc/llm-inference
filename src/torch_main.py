@@ -153,6 +153,81 @@ class KVCache(NamedTuple):
     return xk, xv, self
 
 
+class AttentionBlock:
+  def __init__(
+    self, layer_index: int, params: ModelParams, layer_weights: LayerWeights
+  ):
+    self.idx = layer_index
+    self.params = params
+    self.weights = layer_weights
+
+  def __call__(
+    self,
+    x: torch.Tensor,
+    kvcache: KVCache,
+    cur_pos: int,
+    mask: torch.Tensor,
+    freqs_cis: torch.Tensor,
+  ):
+    x = F.rms_norm(x, x.shape[-1:], self.weights.attention_norm, 1e-6)
+    bsz, _, _ = x.shape
+    hc, hsz, gsz = (
+      self.params.n_local_heads,
+      self.params.head_dim,
+      self.params.n_local_kv_heads,
+    )
+    xq = (x @ self.weights.wq.T).reshape(bsz, -1, hc, hsz)
+    xk = (x @ self.weights.wk.T).reshape(bsz, -1, gsz, hsz)
+    xv = (x @ self.weights.wv.T).reshape(bsz, -1, gsz, hsz)
+    xq, xk = Rope.apply_rotary_emb(xq, xk, freqs_cis)
+    xk, xv, kvcache = kvcache.update(self.idx, bsz, cur_pos, xk, xv, hc // gsz)
+    _scores = torch.einsum("bihd,bjhd->bhij", xq, xk)
+    scores = (_scores + mask) / (hsz**0.5)
+    scores = F.softmax(scores, dim=-1).to(torch.bfloat16)
+    out = torch.einsum("bhij,bjhk->bihk", scores, xv)
+    out = out.reshape(out.shape[0], out.shape[1], -1)
+    return out @ self.weights.wo.T, kvcache, _scores
+
+
+class Transformer:
+  def _ffw(self, x: torch.Tensor, lw: LayerWeights):
+    x = F.rms_norm(x, x.shape[-1:], lw.ffn_norm, 1e-6)
+    return F.silu(x @ lw.w1.T) * (x @ lw.w3.T) @ lw.w2.T
+
+  def __init__(self, model_params: ModelParams, weights: XfmrWeights):
+    self.params = model_params
+    self.weights = weights
+    self.attns = [
+      AttentionBlock(i, model_params, layer_weights)
+      for i, layer_weights in enumerate(self.weights.layer_weights)
+    ]
+
+  def __call__(
+    self,
+    tokens: torch.Tensor,
+    kvcache: KVCache,
+    cur_pos: int,
+    attn_mask: torch.Tensor,
+    freqs_cis: torch.Tensor,
+  ):
+    x = self.weights.tok_embeddings[tokens]
+    x = x[None, :] if len(x.shape) < 3 else x
+
+    for i in range(self.params.n_layers):
+      attn_out, kvcache, scores = self.attns[i](
+        x,
+        kvcache,
+        cur_pos,
+        attn_mask,
+        freqs_cis,
+      )
+      x = x + attn_out
+      x = x + self._ffw(x, self.weights.layer_weights[i])
+    x = F.rms_norm(x, x.shape[-1:], self.weights.norm, 1e-6)
+    logits = x @ self.weights.output.T
+    return logits, kvcache, scores
+
+
 class Llama:
   def _load_weights(self, dir: str, n_layers: int = 16):
     """
@@ -402,6 +477,7 @@ class Llama:
         "object": "chat.completion.chunk",
         "created": int(time.time()),
         "model": "Llama-3.2-1B-Instruct" if self.is_instruct else "Llama-3.2-1B",
+        "current_token_position": cur_pos,
         "choices": [
           {
             "index": 0,
@@ -409,90 +485,18 @@ class Llama:
             "finish_reason": "stop" if is_stop else None,
           }
         ],
-        "current_token_position": cur_pos,
         "top_predictions": [
           {"token": self.tokenizer.decode([token]), "logprob": logprob}
           for token, logprob in zip(candidates[0].tolist(), logprobs[0].tolist())  # type: ignore
         ],
+        "logits_entropy": metrics["logits_entropy"].item(),
+        "logits_varentropy": metrics["logits_varentropy"].item(),
+        "attn_entropy": metrics["attn_entropy"].item(),
+        "attn_varentropy": metrics["attn_varentropy"].item(),
       }
       if is_stop:
         break
       tokens = torch.cat([tokens, next_token], dim=1)
-
-
-class AttentionBlock:
-  def __init__(
-    self, layer_index: int, params: ModelParams, layer_weights: LayerWeights
-  ):
-    self.idx = layer_index
-    self.params = params
-    self.weights = layer_weights
-
-  def __call__(
-    self,
-    x: torch.Tensor,
-    kvcache: KVCache,
-    cur_pos: int,
-    mask: torch.Tensor,
-    freqs_cis: torch.Tensor,
-  ):
-    x = F.rms_norm(x, x.shape[-1:], self.weights.attention_norm, 1e-6)
-    bsz, _, _ = x.shape
-    hc, hsz, gsz = (
-      self.params.n_local_heads,
-      self.params.head_dim,
-      self.params.n_local_kv_heads,
-    )
-    xq = (x @ self.weights.wq.T).reshape(bsz, -1, hc, hsz)
-    xk = (x @ self.weights.wk.T).reshape(bsz, -1, gsz, hsz)
-    xv = (x @ self.weights.wv.T).reshape(bsz, -1, gsz, hsz)
-    xq, xk = Rope.apply_rotary_emb(xq, xk, freqs_cis)
-    xk, xv, kvcache = kvcache.update(self.idx, bsz, cur_pos, xk, xv, hc // gsz)
-    _scores = torch.einsum("bihd,bjhd->bhij", xq, xk)
-    scores = (_scores + mask) / (hsz**0.5)
-    scores = F.softmax(scores, dim=-1).to(torch.bfloat16)
-    out = torch.einsum("bhij,bjhk->bihk", scores, xv)
-    out = out.reshape(out.shape[0], out.shape[1], -1)
-    return out @ self.weights.wo.T, kvcache, _scores
-
-
-class Transformer:
-  def _ffw(self, x: torch.Tensor, lw: LayerWeights):
-    x = F.rms_norm(x, x.shape[-1:], lw.ffn_norm, 1e-6)
-    return F.silu(x @ lw.w1.T) * (x @ lw.w3.T) @ lw.w2.T
-
-  def __init__(self, model_params: ModelParams, weights: XfmrWeights):
-    self.params = model_params
-    self.weights = weights
-    self.attns = [
-      AttentionBlock(i, model_params, layer_weights)
-      for i, layer_weights in enumerate(self.weights.layer_weights)
-    ]
-
-  def __call__(
-    self,
-    tokens: torch.Tensor,
-    kvcache: KVCache,
-    cur_pos: int,
-    attn_mask: torch.Tensor,
-    freqs_cis: torch.Tensor,
-  ):
-    x = self.weights.tok_embeddings[tokens]
-    x = x[None, :] if len(x.shape) < 3 else x
-
-    for i in range(self.params.n_layers):
-      attn_out, kvcache, scores = self.attns[i](
-        x,
-        kvcache,
-        cur_pos,
-        attn_mask,
-        freqs_cis,
-      )
-      x = x + attn_out
-      x = x + self._ffw(x, self.weights.layer_weights[i])
-    x = F.rms_norm(x, x.shape[-1:], self.weights.norm, 1e-6)
-    logits = x @ self.weights.output.T
-    return logits, kvcache, scores
 
 
 if __name__ == "__main__":
@@ -504,4 +508,5 @@ if __name__ == "__main__":
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]))
   for chunk in llama.generate(tokens, attn_mask, sampler="greedy", temp=0.6, k=5):
-    print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
+    print(chunk)
+    # print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
