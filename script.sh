@@ -28,4 +28,4 @@ curl -L https://people.eecs.berkeley.edu/~hendrycks/MATH.tar | tar x --no-same-o
 mv evals/math/MATH/* evals/math/ && rm -r evals/math/MATH
 
 PYTHONPATH='.' python3 src/torch_main.py  # test the inference
-PYTHONPATH='.' python3 evals/evals.py
+PYTHONPATH='.' python -u evals/evals.py >> evals/result.jsonl
