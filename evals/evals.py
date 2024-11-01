@@ -1,8 +1,9 @@
+import re
 from pathlib import Path
 
 import torch
 from math_utils import MATH, load_math
-from mmlu_utils import MMLU, load_mmlu
+from mmlu_utils import MMLU
 from tqdm import tqdm
 
 from src.torch_main import LLAMA_1B_PARAMS, Llama, device
@@ -38,7 +39,7 @@ def mmlu_run(llama: Llama, mmlu_items: list[MMLU]):
       break  # the first char is the answer
 
   accuracy = correct / total
-  print(f"MMLU Accuracy: {accuracy:.2%}")
+  print(f"\nMMLU Accuracy: {accuracy:.2%}")
 
 
 def math_run(llama: Llama, math_items: list[MATH]):
@@ -54,10 +55,18 @@ def math_run(llama: Llama, math_items: list[MATH]):
     tokens = llama.tokenizer.encode(prompt, **encode_kwargs)
     tokens = torch.tensor(tokens, device=device).reshape(1, -1)
     attn_mask = llama._build_attn_mask(tokens.shape[-1], None)
+    response = ""
     for chunk in llama.generate(tokens, attn_mask, sampler="topk_greedy", temp=0, k=25):
       pred = chunk["choices"][0]["delta"]["content"]
+      response += pred
 
-  print(f"\nMath Accuracy: {correct}/{total} = {correct/total:.2%}")
+    pred_match = re.search(r"\\boxed{([^}]*)}", response)
+    true_match = re.search(r"\\boxed{([^}]*)}", math.solution)
+    if pred_match and true_match and pred_match.group(1) == true_match.group(1):
+      # TODO: normalize?
+      correct += 1
+
+  print(f"\nMATH Accuracy: {correct}/{total} = {correct/total:.2%}")
 
 
 if __name__ == "__main__":
@@ -65,7 +74,7 @@ if __name__ == "__main__":
   weight_path = f"src/model/1B{'-Instruct' if is_instruct else ''}"
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, "src/tokenizer.model")
 
-  mmlu_items = list(load_mmlu(Path("evals/mmlu/val")))
-  mmlu_run(llama, mmlu_items)
+  # mmlu_items = list(load_mmlu(Path("evals/mmlu/val")))
+  # mmlu_run(llama, mmlu_items)
   math_items = list(load_math(Path("evals/math/test")))
   math_run(llama, math_items)
