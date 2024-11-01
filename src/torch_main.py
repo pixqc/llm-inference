@@ -15,6 +15,7 @@ elif torch.cuda.is_available():
   device = torch.device("cuda")
 print(f"using device: {device}")
 
+LN_2 = 0.69314718056  # ln(2) = 1.0 / LOG2_E
 Sampler = Literal["greedy", "topk", "topp", "topk_greedy", "minp"]
 
 
@@ -231,8 +232,9 @@ class Llama:
       model_params.use_scaled_rope,
     )
 
+  @staticmethod
   def _get_candidates(
-    self, logits: torch.Tensor, _type: str, temp=0.7, **kwargs
+    logits: torch.Tensor, _type: str, temp=0.7, **kwargs
   ) -> Tuple[torch.Tensor, torch.Tensor]:
     if temp == 0:
       temp = 1e-9
@@ -270,7 +272,8 @@ class Llama:
     logprobs = logprobs - torch.logsumexp(logprobs, dim=-1, keepdim=True)
     return candidates, logprobs
 
-  def _pad_batch(self, batch_tokens: List[torch.Tensor], pad_id: int):
+  @staticmethod
+  def _pad_batch(batch_tokens: List[torch.Tensor], pad_id: int):
     longest_seqlen = max(len(tokens) for tokens in batch_tokens)
     padded_tokens = []
     for tokens in batch_tokens:
@@ -284,7 +287,8 @@ class Llama:
     padded = torch.stack(padded_tokens).to(device=device)
     return padded, (padded == pad_id).to(device=device)
 
-  def _build_attn_mask(self, seqlen: int, pad_mask: Optional[torch.Tensor]):
+  @staticmethod
+  def _build_attn_mask(seqlen: int, pad_mask: Optional[torch.Tensor]):
     mask = torch.full((seqlen, seqlen), float("-inf"), device=device)
     mask = torch.triu(mask, diagonal=1)
     if pad_mask is not None:
@@ -292,23 +296,52 @@ class Llama:
       mask = torch.where(pad_mask, float("-inf"), mask)[:, None, :, :]
     return mask
 
-  def _random_sample(
-    self, candidates: torch.Tensor, logprobs: torch.Tensor, sampler: str
-  ):
+  @staticmethod
+  def _random_sample(candidates: torch.Tensor, logprobs: torch.Tensor, sampler: str):
     if sampler == "topk_greedy" or sampler == "greedy":
       return candidates[:, 0].view(-1, 1), logprobs[:, 0]
-
     idx = torch.multinomial(torch.exp(logprobs), num_samples=1).squeeze()
     batch_indices = torch.arange(candidates.shape[0])
     return candidates[batch_indices, idx].view(-1, 1), logprobs[batch_indices, idx]
 
-  def _format_instruct(self, prompt: str, system_prompt: Optional[str] = None):
+  @staticmethod
+  def _format_instruct(prompt: str, system_prompt: Optional[str] = None):
     return (
       f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
       f"{ '' if system_prompt is None else system_prompt }<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
       f"{ prompt }<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     )
 
+  @staticmethod
+  def _calculate_ent_vent(
+    logits: torch.Tensor, axis: int = -1
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    logprobs = F.log_softmax(logits, dim=axis)
+    probs = torch.exp(logprobs)
+    entropy = -torch.sum(probs * logprobs, dim=axis) / LN_2
+    varentropy = torch.sum(
+      probs * (logprobs / LN_2 + entropy.unsqueeze(-1)) ** 2, dim=axis
+    )
+    return entropy, varentropy
+
+  @staticmethod
+  def _calculate_metrics(
+    logits: torch.Tensor, attn_scores: torch.Tensor
+  ) -> dict[str, torch.Tensor]:
+    entropy, varentropy = Llama._calculate_ent_vent(logits)
+    attn_probs = F.softmax(attn_scores, dim=-1)
+    attn_entropy = -torch.sum(
+      attn_probs * torch.log2(torch.clamp(attn_probs, 1e-10, 1.0)), dim=-1
+    )
+    attn_varentropy = torch.var(attn_entropy, dim=1)
+    return {
+      "logits_entropy": torch.mean(entropy),
+      "logits_varentropy": torch.mean(varentropy),
+      "attn_entropy": torch.mean(attn_entropy),
+      "attn_varentropy": torch.mean(attn_varentropy),
+    }
+
+  # TODO: should tokenization happen on callsite?
   def tokenize(
     self,
     prompts: list[str],
@@ -355,7 +388,10 @@ class Llama:
         x = tokens[:, -1:]
         attn_mask = torch.tensor([0]).to(device=device)
         freqs_cis = self.freqs_cis_all[cur_pos : cur_pos + 1]
-      logits, self.kvcache = self.xfmr(x, self.kvcache, cur_pos, attn_mask, freqs_cis)  # type: ignore
+      logits, self.kvcache, scores = self.xfmr(
+        x, self.kvcache, cur_pos, attn_mask, freqs_cis
+      )  # type: ignore
+      metrics = self._calculate_metrics(logits, scores)
       candidates, logprobs = self._get_candidates(logits, sampler, temp=temp, **kwargs)
       next_token, _ = self._random_sample(candidates, logprobs, sampler)
       is_stop = next_token[0] in self.stop_tokens
@@ -412,8 +448,8 @@ class AttentionBlock:
     xv = (x @ self.weights.wv.T).reshape(bsz, -1, gsz, hsz)
     xq, xk = Rope.apply_rotary_emb(xq, xk, freqs_cis)
     xk, xv, kvcache = kvcache.update(self.idx, bsz, cur_pos, xk, xv, hc // gsz)
-    _scores = torch.einsum("bihd,bjhd->bhij", xq, xk) / (hsz**0.5)
-    scores = _scores + mask
+    _scores = torch.einsum("bihd,bjhd->bhij", xq, xk)
+    scores = (_scores + mask) / (hsz**0.5)
     scores = F.softmax(scores, dim=-1).to(torch.bfloat16)
     out = torch.einsum("bhij,bjhk->bihk", scores, xv)
     out = out.reshape(out.shape[0], out.shape[1], -1)
@@ -445,7 +481,7 @@ class Transformer:
     x = x[None, :] if len(x.shape) < 3 else x
 
     for i in range(self.params.n_layers):
-      attn_out, kvcache, _ = self.attns[i](
+      attn_out, kvcache, scores = self.attns[i](
         x,
         kvcache,
         cur_pos,
@@ -456,14 +492,14 @@ class Transformer:
       x = x + self._ffw(x, self.weights.layer_weights[i])
     x = F.rms_norm(x, x.shape[-1:], self.weights.norm, 1e-6)
     logits = x @ self.weights.output.T
-    return logits, kvcache
+    return logits, kvcache, scores
 
 
 if __name__ == "__main__":
   is_instruct = True
   weight_path, tok_path = "src/model/1B", "src/tokenizer.model"
   weight_path = weight_path + "-Instruct" if is_instruct else weight_path
-  prompts = ["What is Alzheimer's disease?"]
+  prompts = ["Alzheimer's disease is"]
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]))
