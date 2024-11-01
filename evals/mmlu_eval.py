@@ -32,7 +32,6 @@ class MMLU(NamedTuple):
   def format_instruct_q(self) -> str:
     prompt = self.prompt_template()
     return (
-      "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n<|eot_id|>"
       f"<|start_header_id|>user<|end_header_id|>\n\n{prompt}<|eot_id|>"
       f"<|start_header_id|>assistant<|end_header_id|>\n\n"
       f"The best answer is"
@@ -62,7 +61,8 @@ if __name__ == "__main__":
   SYSTEM_PROMPT = (
     "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n<|eot_id|>"
   )
-  fewshot = list(load_mmlu(Path("evals/mmlu/val")))[:2]
+  n_fewshot = 5
+  fewshot = list(load_mmlu(Path("evals/mmlu/val")))[:n_fewshot]
   mmlu = list(load_mmlu(Path("evals/mmlu/test")))
   is_instruct = True
   weight_path = f"src/model/1B{'-Instruct' if is_instruct else ''}"
@@ -71,11 +71,11 @@ if __name__ == "__main__":
   encode_kwargs = {"bos": False, "eos": False, "allowed_special": "all"}
   for mmlu_item in mmlu:
     total += 1
-    prompt = SYSTEM_PROMPT + format_fewshot(fewshot, mmlu_item)
-    # prompt = SYSTEM_PROMPT + mmlu_item.format_instruct_q()
+    # prompt = SYSTEM_PROMPT + format_fewshot(fewshot, mmlu_item)
+    prompt = SYSTEM_PROMPT + mmlu_item.format_instruct_q()
     tokens = llama.tokenizer.encode(prompt, **encode_kwargs)
     tokens = torch.tensor(tokens, device=device).reshape(1, -1)
-    attn_mask = llama._build_attn_mask(len(tokens), None)
+    attn_mask = llama._build_attn_mask(tokens.shape[-1], None)
     print(llama.tokenizer.decode(tokens[0].tolist()), end="")
     for chunk in llama.generate(tokens, attn_mask, sampler="topk_greedy", temp=0, k=4):
       pred = chunk["choices"][0]["delta"]["content"].strip()
