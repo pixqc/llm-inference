@@ -1,4 +1,5 @@
 import hashlib
+import json
 import time
 from dataclasses import dataclass
 from typing import List, Literal, NamedTuple, Optional, Tuple
@@ -181,8 +182,8 @@ class AttentionBlock:
     xv = (x @ self.weights.wv.T).reshape(bsz, -1, gsz, hsz)
     xq, xk = Rope.apply_rotary_emb(xq, xk, freqs_cis)
     xk, xv, kvcache = kvcache.update(self.idx, bsz, cur_pos, xk, xv, hc // gsz)
-    _scores = torch.einsum("bihd,bjhd->bhij", xq, xk)
-    scores = (_scores + mask) / (hsz**0.5)
+    _scores = torch.einsum("bihd,bjhd->bhij", xq, xk) / (hsz**0.5)
+    scores = _scores + mask
     scores = F.softmax(scores, dim=-1).to(torch.bfloat16)
     out = torch.einsum("bhij,bjhk->bihk", scores, xv)
     out = out.reshape(out.shape[0], out.shape[1], -1)
@@ -404,8 +405,8 @@ class Sampler:
     )
 
     last_logits = logits[:, -1]
-    log_probs = F.log_softmax(last_logits, dim=-1)
-    cross_entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1)
+    logprobs = F.log_softmax(last_logits, dim=-1)
+    cross_entropy = -torch.sum(torch.exp(logprobs) * logprobs, dim=-1)
     target_ce = config.target_ce_alpha * cross_entropy + config.target_ce_beta
     temperature = config.temperature * torch.sqrt(target_ce / (cross_entropy + 1e-6))
     temperature = torch.clamp(temperature, 0.1, 2.0)
@@ -644,10 +645,10 @@ if __name__ == "__main__":
   is_instruct = True
   weight_path, tok_path = "src/model/1B", "src/tokenizer.model"
   weight_path = weight_path + "-Instruct" if is_instruct else weight_path
-  prompts = ["Explain WHY 1+1=2."]
+  prompts = ["What is Alzheimer's disease?"]
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]))
-  for chunk in llama.generate(tokens, attn_mask, sampler="entropix", temp=0.6, k=5):
+  for chunk in llama.generate(tokens, attn_mask, sampler="topk", temp=0.6, k=40):
     # print(chunk)
     print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
