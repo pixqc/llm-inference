@@ -18,58 +18,6 @@ print(f"using device: {device}")
 LN_2 = 0.69314718056  # ln(2) = 1.0 / LOG2_E
 
 
-class Sampler:
-  Type = Literal["greedy", "topk", "topp", "topk_greedy", "minp"]
-
-  @staticmethod
-  def get_candidates(
-    logits: torch.Tensor, _type: Type, temp=0.7, **kwargs
-  ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if temp == 0:
-      temp = 1e-9
-    last_logits = logits[:, -1]
-
-    sorted_logits, sorted_indices = torch.sort(last_logits, dim=-1, descending=True)
-    logprobs = torch.nn.functional.log_softmax(sorted_logits / temp, dim=-1)
-    if _type == "greedy":
-      cutoff = 1
-    elif _type == "topk" or _type == "topk_greedy":
-      if "k" not in kwargs:
-        raise ValueError("'k' parameter is required for topk sampling")
-      cutoff = kwargs["k"]
-    elif _type == "minp":
-      if "p" not in kwargs:
-        raise ValueError("'p' parameter is required for minp sampling")
-      p = kwargs["p"]
-      probs = torch.exp(logprobs)
-      cutoff = (probs > p).sum(dim=-1).max().item()
-    elif _type == "topp":
-      if "p" not in kwargs:
-        raise ValueError("'p' parameter is required for topp sampling")
-      p = kwargs["p"]
-      probs = torch.exp(logprobs)
-      probs_cumsum = torch.cumsum(probs, dim=-1)
-      cutoff = (probs_cumsum <= p).sum(dim=-1).max().item()
-    else:
-      raise ValueError(f"Unknown sampling type: {_type}")
-
-    if (_type == "minp" or _type == "topp") and cutoff == 0:
-      cutoff = 50  # fallback to topk
-    candidates = sorted_indices[:, :cutoff]
-    logprobs = logprobs[:, :cutoff]
-
-    logprobs = logprobs - torch.logsumexp(logprobs, dim=-1, keepdim=True)
-    return candidates, logprobs
-
-  @staticmethod
-  def random_choice(candidates: torch.Tensor, logprobs: torch.Tensor, sampler: Type):
-    if sampler == "topk_greedy" or sampler == "greedy":
-      return candidates[:, 0].view(-1, 1), logprobs[:, 0]
-    idx = torch.multinomial(torch.exp(logprobs), num_samples=1).squeeze()
-    batch_indices = torch.arange(candidates.shape[0])
-    return candidates[batch_indices, idx].view(-1, 1), logprobs[batch_indices, idx]
-
-
 class ModelParams(NamedTuple):
   n_layers: int
   n_local_heads: int
@@ -279,6 +227,87 @@ class Transformer:
     return logits, kvcache, scores
 
 
+class Sampler:
+  Type = Literal["greedy", "topk", "topp", "topk_greedy", "minp"]
+
+  @staticmethod
+  def get_candidates(
+    logits: torch.Tensor, _type: Type, temp=0.7, **kwargs
+  ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if temp == 0:
+      temp = 1e-9
+    last_logits = logits[:, -1]
+
+    sorted_logits, sorted_indices = torch.sort(last_logits, dim=-1, descending=True)
+    logprobs = torch.nn.functional.log_softmax(sorted_logits / temp, dim=-1)
+    if _type == "greedy":
+      cutoff = 1
+    elif _type == "topk" or _type == "topk_greedy":
+      if "k" not in kwargs:
+        raise ValueError("'k' parameter is required for topk sampling")
+      cutoff = kwargs["k"]
+    elif _type == "minp":
+      if "p" not in kwargs:
+        raise ValueError("'p' parameter is required for minp sampling")
+      p = kwargs["p"]
+      probs = torch.exp(logprobs)
+      cutoff = (probs > p).sum(dim=-1).max().item()
+    elif _type == "topp":
+      if "p" not in kwargs:
+        raise ValueError("'p' parameter is required for topp sampling")
+      p = kwargs["p"]
+      probs = torch.exp(logprobs)
+      probs_cumsum = torch.cumsum(probs, dim=-1)
+      cutoff = (probs_cumsum <= p).sum(dim=-1).max().item()
+    else:
+      raise ValueError(f"Unknown sampling type: {_type}")
+
+    if (_type == "minp" or _type == "topp") and cutoff == 0:
+      cutoff = 50  # fallback to topk
+    candidates = sorted_indices[:, :cutoff]
+    logprobs = logprobs[:, :cutoff]
+
+    logprobs = logprobs - torch.logsumexp(logprobs, dim=-1, keepdim=True)
+    return candidates, logprobs
+
+  @staticmethod
+  def random_choice(candidates: torch.Tensor, logprobs: torch.Tensor, sampler: Type):
+    if sampler == "topk_greedy" or sampler == "greedy":
+      return candidates[:, 0].view(-1, 1), logprobs[:, 0]
+    idx = torch.multinomial(torch.exp(logprobs), num_samples=1).squeeze()
+    batch_indices = torch.arange(candidates.shape[0])
+    return candidates[batch_indices, idx].view(-1, 1), logprobs[batch_indices, idx]
+
+  @staticmethod
+  def calculate_ent_vent(
+    logits: torch.Tensor, axis: int = -1
+  ) -> tuple[torch.Tensor, torch.Tensor]:
+    logprobs = F.log_softmax(logits, dim=axis)
+    probs = torch.exp(logprobs)
+    entropy = -torch.sum(probs * logprobs, dim=axis) / LN_2
+    varentropy = torch.sum(
+      probs * (logprobs / LN_2 + entropy.unsqueeze(-1)) ** 2, dim=axis
+    )
+    return entropy, varentropy
+
+  @staticmethod
+  def calculate_metrics(
+    logits: torch.Tensor, attn_scores: torch.Tensor
+  ) -> dict[str, torch.Tensor]:
+    entropy, varentropy = Sampler.calculate_ent_vent(logits)
+    attn_probs = F.softmax(attn_scores, dim=-1)
+    attn_entropy = -torch.sum(
+      attn_probs * torch.log2(torch.clamp(attn_probs, 1e-10, 1.0)), dim=-1
+    )
+    attn_varentropy = torch.var(attn_entropy, dim=1)
+    return {
+      "logits_entropy": torch.mean(entropy),
+      "logits_varentropy": torch.mean(varentropy),
+      "attn_entropy": torch.mean(attn_entropy),
+      "attn_varentropy": torch.mean(attn_varentropy),
+    }
+
+
 class Llama:
   def _load_weights(self, dir: str, n_layers: int = 16):
     """
@@ -383,49 +412,12 @@ class Llama:
     return mask
 
   @staticmethod
-  def _random_sample(candidates: torch.Tensor, logprobs: torch.Tensor, sampler: str):
-    if sampler == "topk_greedy" or sampler == "greedy":
-      return candidates[:, 0].view(-1, 1), logprobs[:, 0]
-    idx = torch.multinomial(torch.exp(logprobs), num_samples=1).squeeze()
-    batch_indices = torch.arange(candidates.shape[0])
-    return candidates[batch_indices, idx].view(-1, 1), logprobs[batch_indices, idx]
-
-  @staticmethod
   def _format_instruct(prompt: str, system_prompt: Optional[str] = None):
     return (
       f"<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n"
       f"{ '' if system_prompt is None else system_prompt }<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
       f"{ prompt }<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
     )
-
-  @staticmethod
-  def _calculate_ent_vent(
-    logits: torch.Tensor, axis: int = -1
-  ) -> tuple[torch.Tensor, torch.Tensor]:
-    logprobs = F.log_softmax(logits, dim=axis)
-    probs = torch.exp(logprobs)
-    entropy = -torch.sum(probs * logprobs, dim=axis) / LN_2
-    varentropy = torch.sum(
-      probs * (logprobs / LN_2 + entropy.unsqueeze(-1)) ** 2, dim=axis
-    )
-    return entropy, varentropy
-
-  @staticmethod
-  def _calculate_metrics(
-    logits: torch.Tensor, attn_scores: torch.Tensor
-  ) -> dict[str, torch.Tensor]:
-    entropy, varentropy = Llama._calculate_ent_vent(logits)
-    attn_probs = F.softmax(attn_scores, dim=-1)
-    attn_entropy = -torch.sum(
-      attn_probs * torch.log2(torch.clamp(attn_probs, 1e-10, 1.0)), dim=-1
-    )
-    attn_varentropy = torch.var(attn_entropy, dim=1)
-    return {
-      "logits_entropy": torch.mean(entropy),
-      "logits_varentropy": torch.mean(varentropy),
-      "attn_entropy": torch.mean(attn_entropy),
-      "attn_varentropy": torch.mean(attn_varentropy),
-    }
 
   # TODO: should tokenization happen on callsite?
   def tokenize(
@@ -477,7 +469,7 @@ class Llama:
       logits, self.kvcache, scores = self.xfmr(
         x, self.kvcache, cur_pos, attn_mask, freqs_cis
       )  # type: ignore
-      metrics = self._calculate_metrics(logits, scores)
+      metrics = Sampler.calculate_metrics(logits, scores)
       candidates, logprobs = Sampler.get_candidates(
         logits, sampler, temp=temp, **kwargs
       )
