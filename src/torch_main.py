@@ -16,7 +16,58 @@ elif torch.cuda.is_available():
 print(f"using device: {device}")
 
 LN_2 = 0.69314718056  # ln(2) = 1.0 / LOG2_E
-Sampler = Literal["greedy", "topk", "topp", "topk_greedy", "minp"]
+
+
+class Sampler:
+  Type = Literal["greedy", "topk", "topp", "topk_greedy", "minp"]
+
+  @staticmethod
+  def get_candidates(
+    logits: torch.Tensor, _type: Type, temp=0.7, **kwargs
+  ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if temp == 0:
+      temp = 1e-9
+    last_logits = logits[:, -1]
+
+    sorted_logits, sorted_indices = torch.sort(last_logits, dim=-1, descending=True)
+    logprobs = torch.nn.functional.log_softmax(sorted_logits / temp, dim=-1)
+    if _type == "greedy":
+      cutoff = 1
+    elif _type == "topk" or _type == "topk_greedy":
+      if "k" not in kwargs:
+        raise ValueError("'k' parameter is required for topk sampling")
+      cutoff = kwargs["k"]
+    elif _type == "minp":
+      if "p" not in kwargs:
+        raise ValueError("'p' parameter is required for minp sampling")
+      p = kwargs["p"]
+      probs = torch.exp(logprobs)
+      cutoff = (probs > p).sum(dim=-1).max().item()
+    elif _type == "topp":
+      if "p" not in kwargs:
+        raise ValueError("'p' parameter is required for topp sampling")
+      p = kwargs["p"]
+      probs = torch.exp(logprobs)
+      probs_cumsum = torch.cumsum(probs, dim=-1)
+      cutoff = (probs_cumsum <= p).sum(dim=-1).max().item()
+    else:
+      raise ValueError(f"Unknown sampling type: {_type}")
+
+    if (_type == "minp" or _type == "topp") and cutoff == 0:
+      cutoff = 50  # fallback to topk
+    candidates = sorted_indices[:, :cutoff]
+    logprobs = logprobs[:, :cutoff]
+
+    logprobs = logprobs - torch.logsumexp(logprobs, dim=-1, keepdim=True)
+    return candidates, logprobs
+
+  @staticmethod
+  def random_choice(candidates: torch.Tensor, logprobs: torch.Tensor, sampler: Type):
+    if sampler == "topk_greedy" or sampler == "greedy":
+      return candidates[:, 0].view(-1, 1), logprobs[:, 0]
+    idx = torch.multinomial(torch.exp(logprobs), num_samples=1).squeeze()
+    batch_indices = torch.arange(candidates.shape[0])
+    return candidates[batch_indices, idx].view(-1, 1), logprobs[batch_indices, idx]
 
 
 class ModelParams(NamedTuple):
@@ -308,46 +359,6 @@ class Llama:
     )
 
   @staticmethod
-  def _get_candidates(
-    logits: torch.Tensor, _type: str, temp=0.7, **kwargs
-  ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if temp == 0:
-      temp = 1e-9
-    last_logits = logits[:, -1]
-
-    sorted_logits, sorted_indices = torch.sort(last_logits, dim=-1, descending=True)
-    logprobs = torch.nn.functional.log_softmax(sorted_logits / temp, dim=-1)
-    if _type == "greedy":
-      cutoff = 1
-    elif _type == "topk" or _type == "topk_greedy":
-      if "k" not in kwargs:
-        raise ValueError("'k' parameter is required for topk sampling")
-      cutoff = kwargs["k"]
-    elif _type == "minp":
-      if "p" not in kwargs:
-        raise ValueError("'p' parameter is required for minp sampling")
-      p = kwargs["p"]
-      probs = torch.exp(logprobs)
-      cutoff = (probs > p).sum(dim=-1).max().item()
-    elif _type == "topp":
-      if "p" not in kwargs:
-        raise ValueError("'p' parameter is required for topp sampling")
-      p = kwargs["p"]
-      probs = torch.exp(logprobs)
-      probs_cumsum = torch.cumsum(probs, dim=-1)
-      cutoff = (probs_cumsum <= p).sum(dim=-1).max().item()
-    else:
-      raise ValueError(f"Unknown sampling type: {_type}")
-
-    if (_type == "minp" or _type == "topp") and cutoff == 0:
-      cutoff = 50  # fallback to topk
-    candidates = sorted_indices[:, :cutoff]
-    logprobs = logprobs[:, :cutoff]
-
-    logprobs = logprobs - torch.logsumexp(logprobs, dim=-1, keepdim=True)
-    return candidates, logprobs
-
-  @staticmethod
   def _pad_batch(batch_tokens: List[torch.Tensor], pad_id: int):
     longest_seqlen = max(len(tokens) for tokens in batch_tokens)
     padded_tokens = []
@@ -446,7 +457,7 @@ class Llama:
     self,
     tokens: torch.Tensor,
     attn_mask: torch.Tensor,
-    sampler: Sampler,
+    sampler: Sampler.Type,
     temp: float,
     **kwargs,
   ):
@@ -467,8 +478,10 @@ class Llama:
         x, self.kvcache, cur_pos, attn_mask, freqs_cis
       )  # type: ignore
       metrics = self._calculate_metrics(logits, scores)
-      candidates, logprobs = self._get_candidates(logits, sampler, temp=temp, **kwargs)
-      next_token, _ = self._random_sample(candidates, logprobs, sampler)
+      candidates, logprobs = Sampler.get_candidates(
+        logits, sampler, temp=temp, **kwargs
+      )
+      next_token, _ = Sampler.random_choice(candidates, logprobs, sampler)
       is_stop = next_token[0] in self.stop_tokens
       cur_pos = tokens.shape[-1] if cur_pos == 0 else cur_pos + 1
 
@@ -508,5 +521,5 @@ if __name__ == "__main__":
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]))
   for chunk in llama.generate(tokens, attn_mask, sampler="greedy", temp=0.6, k=5):
-    print(chunk)
-    # print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
+    # print(chunk)
+    print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
