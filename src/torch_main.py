@@ -308,8 +308,79 @@ class Sampler:
     elif _type == "entropix":
       if "metrics" not in kwargs:
         raise ValueError("'metrics' parameter is required for entropix sampling")
+      config = SamplerConfig()
       metrics = kwargs["metrics"]
-      return Sampler.entropix_sample(logits, metrics)
+      ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
+      attn_ent, attn_vent = metrics["attn_entropy"], metrics["attn_varentropy"]
+
+      LELV = (
+        ent < config.low_logits_entropy_threshold
+        and vent < config.low_logits_varentropy_threshold
+        and attn_ent < config.low_attention_entropy_threshold
+        and attn_vent < config.low_attention_varentropy_threshold
+      )
+      HELV = (
+        ent > config.high_logits_entropy_threshold
+        and vent < config.low_logits_varentropy_threshold
+        and attn_ent < config.low_attention_entropy_threshold
+        and attn_vent < config.low_attention_varentropy_threshold
+      )
+      LEHV = (
+        ent < config.high_logits_entropy_threshold
+        and vent > config.high_logits_varentropy_threshold
+        and attn_ent < config.low_attention_entropy_threshold
+        and attn_vent > config.high_attention_varentropy_threshold
+      )
+      HEHV = (
+        ent > config.medium_logits_entropy_threshold
+        and vent > config.high_logits_varentropy_threshold
+        and attn_ent > config.high_attention_entropy_threshold
+        and attn_vent > config.high_attention_varentropy_threshold
+      )
+
+      if LELV:  # argmax
+        # Low Entropy, Low Varentropy: "flowing with unspoken intent"
+        cutoff = 1
+      elif HELV:
+        # High Entropy, Low Varentropy: "treading carefully, asking clarifying questions"
+        clarifying_question_token = 2564
+        cutoff = 1
+        candidates = [[clarifying_question_token]]
+        logprobs = torch.tensor([[0.0]])
+        print("helv")
+      elif LEHV:
+        # Low Entropy, High Varentropy: "exploring forks in the path"
+        probs = torch.exp(logprobs)
+        topk_cutoff = config.top_k
+        minp_cutoff = (probs > config.min_probability).sum(dim=-1).max().item()
+        sorted_probs = torch.sort(probs, dim=-1, descending=True)[0]
+        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+        topp_cutoff = (cumsum_probs <= config.top_p).sum(dim=-1).max().item()
+        cutoff = min(topk_cutoff, minp_cutoff, topp_cutoff)
+        temp = config.temperature
+        print("lehv")
+      elif HEHV:
+        # High Entropy, High Varentropy: "resampling in the mist"
+        temp = (
+          config.high_entropy_varentropy_attention_offset
+          + config.high_entropy_varentropy_attention_coefficient * attn_vent
+        )
+        top_p_adj = torch.maximum(
+          torch.tensor(0.5),
+          config.top_p - config.high_entropy_attention_coefficient * attn_ent,
+        )
+        probs = torch.exp(logprobs)
+        topk_cutoff = config.top_k
+        minp_cutoff = (probs > config.min_probability).sum(dim=-1).max().item()
+        sorted_probs = torch.sort(probs, dim=-1, descending=True)[0]
+        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+        topp_cutoff = (cumsum_probs <= top_p_adj).sum(dim=-1).max().item()
+        cutoffs = [topk_cutoff, minp_cutoff, topp_cutoff]
+        cutoff = min([cutoff for cutoff in cutoffs if cutoff > 0])
+        print("hehv")
+      else:
+        # should be adaptive sampling but argmax for now
+        cutoff = 1
     else:
       raise ValueError(f"Unknown sampling type: {_type}")
 
@@ -317,7 +388,6 @@ class Sampler:
       cutoff = 50  # fallback to topk
     candidates = sorted_indices[:, :cutoff]
     logprobs = logprobs[:, :cutoff]
-
     logprobs = logprobs - torch.logsumexp(logprobs, dim=-1, keepdim=True)
     return candidates, logprobs
 
@@ -357,92 +427,6 @@ class Sampler:
       "attn_entropy": torch.mean(attn_entropy),
       "attn_varentropy": torch.mean(attn_varentropy),
     }
-
-  @staticmethod
-  def entropix_sample(
-    logits: torch.Tensor,
-    metrics: dict,
-    clarifying_question_token: int = 2564,
-    config: Optional[SamplerConfig] = None,
-  ) -> Tuple[torch.Tensor, torch.Tensor]:
-    if config is None:
-      config = SamplerConfig()
-    ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
-    attn_ent, attn_vent = metrics["attn_entropy"], metrics["attn_varentropy"]
-
-    def _and(*conditions):
-      result = torch.ones(1, dtype=torch.bool, device=device)
-      for c in conditions:
-        result = result & c
-      return result
-
-    LELV = _and(
-      ent < config.low_logits_entropy_threshold,
-      vent < config.low_logits_varentropy_threshold,
-      attn_ent < config.low_attention_entropy_threshold,
-      attn_vent < config.low_attention_varentropy_threshold,
-    )
-
-    HELV = _and(
-      ent > config.high_logits_entropy_threshold,
-      vent < config.low_logits_varentropy_threshold,
-      attn_ent < config.low_attention_entropy_threshold,
-      attn_vent < config.low_attention_varentropy_threshold,
-    )
-
-    LEHV = _and(
-      ent < config.high_logits_entropy_threshold,
-      vent > config.high_logits_varentropy_threshold,
-      attn_ent < config.low_attention_entropy_threshold,
-      attn_vent > config.high_attention_varentropy_threshold,
-    )
-
-    HEHV = _and(
-      ent > config.medium_logits_entropy_threshold,
-      vent > config.high_logits_varentropy_threshold,
-      attn_ent > config.high_attention_entropy_threshold,
-      attn_vent > config.high_attention_varentropy_threshold,
-    )
-
-    last_logits = logits[:, -1]
-    logprobs = F.log_softmax(last_logits, dim=-1)
-    cross_entropy = -torch.sum(torch.exp(logprobs) * logprobs, dim=-1)
-    target_ce = config.target_ce_alpha * cross_entropy + config.target_ce_beta
-    temperature = config.temperature * torch.sqrt(target_ce / (cross_entropy + 1e-6))
-    temperature = torch.clamp(temperature, 0.1, 2.0)
-
-    min_p = torch.clamp(
-      config.min_probability * (1 - config.adaptive_min_p_coefficient * vent), 0.01, 0.5
-    )
-
-    if LELV:
-      # Low Entropy, Low Varentropy: "flowing with unspoken intent"
-      candidates = torch.argmax(last_logits, dim=-1, keepdim=True)
-      logprobs = torch.zeros_like(candidates, dtype=torch.float32)
-    elif HELV:
-      # High Entropy, Low Varentropy: "treading carefully, asking clarifying questions"
-      candidates = torch.tensor([[clarifying_question_token]], device=device)
-      logprobs = torch.zeros_like(candidates, dtype=torch.float32)
-    elif LEHV:
-      # Low Entropy, High Varentropy: "exploring forks in the path"
-      candidates, logprobs = Sampler.get_candidates(logits, "topk", k=config.top_k)
-    elif HEHV:
-      # High Entropy, High Varentropy: "resampling in the mist"
-      temp_adj = (
-        config.high_entropy_varentropy_attention_offset
-        + config.high_entropy_varentropy_attention_coefficient * attn_vent
-      )
-      top_p_adj = max(
-        0.5, config.top_p - config.high_entropy_attention_coefficient * attn_ent
-      )
-      candidates, logprobs = Sampler.get_candidates(
-        logits, "topp", temp=min(2.0, config.temperature * temp_adj), p=top_p_adj
-      )
-    else:
-      candidates, logprobs = Sampler.get_candidates(
-        logits, "topk", temp=temperature.item(), k=config.top_k, p=min_p.item()
-      )
-    return candidates, logprobs
 
 
 class Llama:
@@ -649,6 +633,6 @@ if __name__ == "__main__":
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]))
-  for chunk in llama.generate(tokens, attn_mask, sampler="topk", temp=0.6, k=40):
+  for chunk in llama.generate(tokens, attn_mask, sampler="entropix", temp=0.6, k=40):
     # print(chunk)
     print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
