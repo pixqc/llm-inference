@@ -1,5 +1,6 @@
 import hashlib
 import time
+from dataclasses import dataclass
 from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
@@ -227,9 +228,6 @@ class Transformer:
     return logits, kvcache, scores
 
 
-from dataclasses import dataclass
-
-
 @dataclass
 class SamplerConfig:
   low_logits_entropy_threshold: float = 0.8
@@ -307,10 +305,10 @@ class Sampler:
       probs_cumsum = torch.cumsum(probs, dim=-1)
       cutoff = (probs_cumsum <= p).sum(dim=-1).max().item()
     elif _type == "entropix":
-      if "entropies" not in kwargs:
+      if "metrics" not in kwargs:
         raise ValueError("'metrics' parameter is required for entropix sampling")
-      entropies = kwargs["entropies"]
-      return Sampler.entropix_sample(logits, entropies)
+      metrics = kwargs["metrics"]
+      return Sampler.entropix_sample(logits, metrics)
     else:
       raise ValueError(f"Unknown sampling type: {_type}")
 
@@ -343,7 +341,7 @@ class Sampler:
     return entropy, varentropy
 
   @staticmethod
-  def calculate_entropies(
+  def calculate_metrics(
     logits: torch.Tensor, attn_scores: torch.Tensor
   ) -> dict[str, torch.Tensor]:
     entropy, varentropy = Sampler.calculate_ent_vent(logits)
@@ -368,11 +366,8 @@ class Sampler:
   ) -> Tuple[torch.Tensor, torch.Tensor]:
     if config is None:
       config = SamplerConfig()
-
-    ent = metrics["logits_entropy"]
-    vent = metrics["logits_varentropy"]
-    attn_ent = metrics["attn_entropy"]
-    attn_vent = metrics["attn_varentropy"]
+    ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
+    attn_ent, attn_vent = metrics["attn_entropy"], metrics["attn_varentropy"]
 
     def _and(*conditions):
       result = torch.ones(1, dtype=torch.bool, device=device)
@@ -380,7 +375,6 @@ class Sampler:
         result = result & c
       return result
 
-    # Case detection based on metrics
     LELV = _and(
       ent < config.low_logits_entropy_threshold,
       vent < config.low_logits_varentropy_threshold,
@@ -409,7 +403,6 @@ class Sampler:
       attn_vent > config.high_attention_varentropy_threshold,
     )
 
-    # Adaptive sampling implementation
     last_logits = logits[:, -1]
     log_probs = F.log_softmax(last_logits, dim=-1)
     cross_entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1)
@@ -422,18 +415,18 @@ class Sampler:
     )
 
     if LELV:
-      # Low Entropy, Low Varentropy: greedy sampling
+      # Low Entropy, Low Varentropy: "flowing with unspoken intent"
       candidates = torch.argmax(last_logits, dim=-1, keepdim=True)
       logprobs = torch.zeros_like(candidates, dtype=torch.float32)
     elif HELV:
-      # High Entropy, Low Varentropy: use clarifying token
+      # High Entropy, Low Varentropy: "treading carefully, asking clarifying questions"
       candidates = torch.tensor([[clarifying_question_token]], device=device)
       logprobs = torch.zeros_like(candidates, dtype=torch.float32)
     elif LEHV:
-      # Low Entropy, High Varentropy: use standard top-k
+      # Low Entropy, High Varentropy: "exploring forks in the path"
       candidates, logprobs = Sampler.get_candidates(logits, "topk", k=config.top_k)
     elif HEHV:
-      # High Entropy, High Varentropy: adjusted temperature and top_p
+      # High Entropy, High Varentropy: "resampling in the mist"
       temp_adj = (
         config.high_entropy_varentropy_attention_offset
         + config.high_entropy_varentropy_attention_coefficient * attn_vent
@@ -445,11 +438,9 @@ class Sampler:
         logits, "topp", temp=min(2.0, config.temperature * temp_adj), p=top_p_adj
       )
     else:
-      # Default adaptive sampling
       candidates, logprobs = Sampler.get_candidates(
         logits, "topk", temp=temperature.item(), k=config.top_k, p=min_p.item()
       )
-
     return candidates, logprobs
 
 
@@ -614,9 +605,9 @@ class Llama:
       logits, self.kvcache, scores = self.xfmr(
         x, self.kvcache, cur_pos, attn_mask, freqs_cis
       )  # type: ignore
-      entropies = Sampler.calculate_entropies(logits, scores)
+      metrics = Sampler.calculate_metrics(logits, scores)
       candidates, logprobs = Sampler.get_candidates(
-        logits, sampler, temp=temp, entropies=entropies, **kwargs
+        logits, sampler, temp=temp, metrics=metrics, **kwargs
       )
       next_token, _ = Sampler.random_choice(candidates, logprobs, sampler)
       is_stop = next_token[0] in self.stop_tokens
@@ -639,10 +630,10 @@ class Llama:
           {"token": self.tokenizer.decode([token]), "logprob": logprob}
           for token, logprob in zip(candidates[0].tolist(), logprobs[0].tolist())  # type: ignore
         ],
-        "logits_entropy": entropies["logits_entropy"].item(),
-        "logits_varentropy": entropies["logits_varentropy"].item(),
-        "attn_entropy": entropies["attn_entropy"].item(),
-        "attn_varentropy": entropies["attn_varentropy"].item(),
+        "logits_entropy": metrics["logits_entropy"].item(),
+        "logits_varentropy": metrics["logits_varentropy"].item(),
+        "attn_entropy": metrics["attn_entropy"].item(),
+        "attn_varentropy": metrics["attn_varentropy"].item(),
       }
       if is_stop:
         break
@@ -653,7 +644,7 @@ if __name__ == "__main__":
   is_instruct = True
   weight_path, tok_path = "src/model/1B", "src/tokenizer.model"
   weight_path = weight_path + "-Instruct" if is_instruct else weight_path
-  prompts = ["Which is bigger, 9.11 or 9.9?"]
+  prompts = ["Explain WHY 1+1=2."]
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]))
