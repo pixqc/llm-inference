@@ -227,8 +227,55 @@ class Transformer:
     return logits, kvcache, scores
 
 
+from dataclasses import dataclass
+
+
+@dataclass
+class SamplerConfig:
+  low_logits_entropy_threshold: float = 0.8
+  medium_logits_entropy_threshold: float = 1.7
+  high_logits_entropy_threshold: float = 2.5
+
+  # Varentropy thresholds
+  low_logits_varentropy_threshold: float = 0.4
+  high_logits_varentropy_threshold: float = 1.2
+
+  # Attention metrics thresholds
+  low_attention_entropy_threshold: float = 1.0
+  high_attention_entropy_threshold: float = 2.0
+  low_attention_varentropy_threshold: float = 0.3
+  high_attention_varentropy_threshold: float = 0.8
+
+  # Base sampling parameters
+  temperature: float = 0.8
+  top_k: int = 40
+  top_p: float = 0.9
+  min_probability: float = 0.05
+
+  # Adaptive sampling parameters
+  target_ce_alpha: float = 1.2
+  target_ce_beta: float = 2.0
+  number_of_adaptive_samples: int = 5
+  adaptive_temperature_logits_coefficient: float = 0.3
+  adaptive_temperature_attention_coefficient: float = 0.2
+  adaptive_top_p_coefficient: float = 0.15
+  adaptive_min_p_coefficient: float = 0.2
+
+  # Scoring coefficients
+  adaptive_score_logits_entropy_coefficient: float = 1.0
+  adaptive_score_attention_entropy_coefficient: float = 0.8
+  adaptive_score_logits_varentropy_coefficient: float = 0.6
+  adaptive_score_attention_varentropy_coefficient: float = 0.4
+
+  # High entropy adjustments
+  high_entropy_attention_offset: float = 0.2
+  high_entropy_attention_coefficient: float = 0.3
+  high_entropy_varentropy_attention_offset: float = 0.3
+  high_entropy_varentropy_attention_coefficient: float = 0.25
+
+
 class Sampler:
-  Type = Literal["greedy", "topk", "topp", "topk_greedy", "minp"]
+  Type = Literal["greedy", "topk", "topp", "topk_greedy", "minp", "entropix"]
 
   @staticmethod
   def get_candidates(
@@ -259,6 +306,11 @@ class Sampler:
       probs = torch.exp(logprobs)
       probs_cumsum = torch.cumsum(probs, dim=-1)
       cutoff = (probs_cumsum <= p).sum(dim=-1).max().item()
+    elif _type == "entropix":
+      if "entropies" not in kwargs:
+        raise ValueError("'metrics' parameter is required for entropix sampling")
+      entropies = kwargs["entropies"]
+      return Sampler.entropix_sample(logits, entropies)
     else:
       raise ValueError(f"Unknown sampling type: {_type}")
 
@@ -291,7 +343,7 @@ class Sampler:
     return entropy, varentropy
 
   @staticmethod
-  def calculate_metrics(
+  def calculate_entropies(
     logits: torch.Tensor, attn_scores: torch.Tensor
   ) -> dict[str, torch.Tensor]:
     entropy, varentropy = Sampler.calculate_ent_vent(logits)
@@ -306,6 +358,99 @@ class Sampler:
       "attn_entropy": torch.mean(attn_entropy),
       "attn_varentropy": torch.mean(attn_varentropy),
     }
+
+  @staticmethod
+  def entropix_sample(
+    logits: torch.Tensor,
+    metrics: dict,
+    clarifying_question_token: int = 2564,
+    config: Optional[SamplerConfig] = None,
+  ) -> Tuple[torch.Tensor, torch.Tensor]:
+    if config is None:
+      config = SamplerConfig()
+
+    ent = metrics["logits_entropy"]
+    vent = metrics["logits_varentropy"]
+    attn_ent = metrics["attn_entropy"]
+    attn_vent = metrics["attn_varentropy"]
+
+    def _and(*conditions):
+      result = torch.ones(1, dtype=torch.bool, device=device)
+      for c in conditions:
+        result = result & c
+      return result
+
+    # Case detection based on metrics
+    LELV = _and(
+      ent < config.low_logits_entropy_threshold,
+      vent < config.low_logits_varentropy_threshold,
+      attn_ent < config.low_attention_entropy_threshold,
+      attn_vent < config.low_attention_varentropy_threshold,
+    )
+
+    HELV = _and(
+      ent > config.high_logits_entropy_threshold,
+      vent < config.low_logits_varentropy_threshold,
+      attn_ent < config.low_attention_entropy_threshold,
+      attn_vent < config.low_attention_varentropy_threshold,
+    )
+
+    LEHV = _and(
+      ent < config.high_logits_entropy_threshold,
+      vent > config.high_logits_varentropy_threshold,
+      attn_ent < config.low_attention_entropy_threshold,
+      attn_vent > config.high_attention_varentropy_threshold,
+    )
+
+    HEHV = _and(
+      ent > config.medium_logits_entropy_threshold,
+      vent > config.high_logits_varentropy_threshold,
+      attn_ent > config.high_attention_entropy_threshold,
+      attn_vent > config.high_attention_varentropy_threshold,
+    )
+
+    # Adaptive sampling implementation
+    last_logits = logits[:, -1]
+    log_probs = F.log_softmax(last_logits, dim=-1)
+    cross_entropy = -torch.sum(torch.exp(log_probs) * log_probs, dim=-1)
+    target_ce = config.target_ce_alpha * cross_entropy + config.target_ce_beta
+    temperature = config.temperature * torch.sqrt(target_ce / (cross_entropy + 1e-6))
+    temperature = torch.clamp(temperature, 0.1, 2.0)
+
+    min_p = torch.clamp(
+      config.min_probability * (1 - config.adaptive_min_p_coefficient * vent), 0.01, 0.5
+    )
+
+    if LELV:
+      # Low Entropy, Low Varentropy: greedy sampling
+      candidates = torch.argmax(last_logits, dim=-1, keepdim=True)
+      logprobs = torch.zeros_like(candidates, dtype=torch.float32)
+    elif HELV:
+      # High Entropy, Low Varentropy: use clarifying token
+      candidates = torch.tensor([[clarifying_question_token]], device=device)
+      logprobs = torch.zeros_like(candidates, dtype=torch.float32)
+    elif LEHV:
+      # Low Entropy, High Varentropy: use standard top-k
+      candidates, logprobs = Sampler.get_candidates(logits, "topk", k=config.top_k)
+    elif HEHV:
+      # High Entropy, High Varentropy: adjusted temperature and top_p
+      temp_adj = (
+        config.high_entropy_varentropy_attention_offset
+        + config.high_entropy_varentropy_attention_coefficient * attn_vent
+      )
+      top_p_adj = max(
+        0.5, config.top_p - config.high_entropy_attention_coefficient * attn_ent
+      )
+      candidates, logprobs = Sampler.get_candidates(
+        logits, "topp", temp=min(2.0, config.temperature * temp_adj), p=top_p_adj
+      )
+    else:
+      # Default adaptive sampling
+      candidates, logprobs = Sampler.get_candidates(
+        logits, "topk", temp=temperature.item(), k=config.top_k, p=min_p.item()
+      )
+
+    return candidates, logprobs
 
 
 class Llama:
@@ -469,9 +614,9 @@ class Llama:
       logits, self.kvcache, scores = self.xfmr(
         x, self.kvcache, cur_pos, attn_mask, freqs_cis
       )  # type: ignore
-      metrics = Sampler.calculate_metrics(logits, scores)
+      entropies = Sampler.calculate_entropies(logits, scores)
       candidates, logprobs = Sampler.get_candidates(
-        logits, sampler, temp=temp, **kwargs
+        logits, sampler, temp=temp, entropies=entropies, **kwargs
       )
       next_token, _ = Sampler.random_choice(candidates, logprobs, sampler)
       is_stop = next_token[0] in self.stop_tokens
@@ -494,10 +639,10 @@ class Llama:
           {"token": self.tokenizer.decode([token]), "logprob": logprob}
           for token, logprob in zip(candidates[0].tolist(), logprobs[0].tolist())  # type: ignore
         ],
-        "logits_entropy": metrics["logits_entropy"].item(),
-        "logits_varentropy": metrics["logits_varentropy"].item(),
-        "attn_entropy": metrics["attn_entropy"].item(),
-        "attn_varentropy": metrics["attn_varentropy"].item(),
+        "logits_entropy": entropies["logits_entropy"].item(),
+        "logits_varentropy": entropies["logits_varentropy"].item(),
+        "attn_entropy": entropies["attn_entropy"].item(),
+        "attn_varentropy": entropies["attn_varentropy"].item(),
       }
       if is_stop:
         break
@@ -508,10 +653,10 @@ if __name__ == "__main__":
   is_instruct = True
   weight_path, tok_path = "src/model/1B", "src/tokenizer.model"
   weight_path = weight_path + "-Instruct" if is_instruct else weight_path
-  prompts = ["Alzheimer's disease is"]
+  prompts = ["Which is bigger, 9.11 or 9.9?"]
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]))
-  for chunk in llama.generate(tokens, attn_mask, sampler="greedy", temp=0.6, k=5):
+  for chunk in llama.generate(tokens, attn_mask, sampler="entropix", temp=0.6, k=5):
     # print(chunk)
     print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
