@@ -1,7 +1,5 @@
 import hashlib
-import json
 import time
-from dataclasses import dataclass
 from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
@@ -187,7 +185,7 @@ class AttentionBlock:
     scores = F.softmax(scores, dim=-1).to(torch.bfloat16)
     out = torch.einsum("bhij,bjhk->bihk", scores, xv)
     out = out.reshape(out.shape[0], out.shape[1], -1)
-    return out @ self.weights.wo.T, kvcache, _scores
+    return out @ self.weights.wo.T, kvcache
 
 
 class Transformer:
@@ -215,7 +213,7 @@ class Transformer:
     x = x[None, :] if len(x.shape) < 3 else x
 
     for i in range(self.params.n_layers):
-      attn_out, kvcache, scores = self.attns[i](
+      attn_out, kvcache = self.attns[i](
         x,
         kvcache,
         cur_pos,
@@ -226,55 +224,11 @@ class Transformer:
       x = x + self._ffw(x, self.weights.layer_weights[i])
     x = F.rms_norm(x, x.shape[-1:], self.weights.norm, 1e-6)
     logits = x @ self.weights.output.T
-    return logits, kvcache, scores
-
-
-@dataclass
-class SamplerConfig:
-  low_logits_entropy_threshold: float = 0.8
-  medium_logits_entropy_threshold: float = 1.7
-  high_logits_entropy_threshold: float = 2.5
-
-  # Varentropy thresholds
-  low_logits_varentropy_threshold: float = 0.4
-  high_logits_varentropy_threshold: float = 1.2
-
-  # Attention metrics thresholds
-  low_attention_entropy_threshold: float = 1.0
-  high_attention_entropy_threshold: float = 2.0
-  low_attention_varentropy_threshold: float = 0.3
-  high_attention_varentropy_threshold: float = 0.8
-
-  # Base sampling parameters
-  temperature: float = 0.8
-  top_k: int = 40
-  top_p: float = 0.9
-  min_probability: float = 0.05
-
-  # Adaptive sampling parameters
-  target_ce_alpha: float = 1.2
-  target_ce_beta: float = 2.0
-  number_of_adaptive_samples: int = 5
-  adaptive_temperature_logits_coefficient: float = 0.3
-  adaptive_temperature_attention_coefficient: float = 0.2
-  adaptive_top_p_coefficient: float = 0.15
-  adaptive_min_p_coefficient: float = 0.2
-
-  # Scoring coefficients
-  adaptive_score_logits_entropy_coefficient: float = 1.0
-  adaptive_score_attention_entropy_coefficient: float = 0.8
-  adaptive_score_logits_varentropy_coefficient: float = 0.6
-  adaptive_score_attention_varentropy_coefficient: float = 0.4
-
-  # High entropy adjustments
-  high_entropy_attention_offset: float = 0.2
-  high_entropy_attention_coefficient: float = 0.3
-  high_entropy_varentropy_attention_offset: float = 0.3
-  high_entropy_varentropy_attention_coefficient: float = 0.25
+    return logits, kvcache
 
 
 class Sampler:
-  Type = Literal["greedy", "topk", "topp", "topk_greedy", "minp", "entropix"]
+  Type = Literal["greedy", "topk", "topp", "topk_greedy", "minp"]
 
   @staticmethod
   def get_candidates(
@@ -305,82 +259,6 @@ class Sampler:
       probs = torch.exp(logprobs)
       probs_cumsum = torch.cumsum(probs, dim=-1)
       cutoff = (probs_cumsum <= p).sum(dim=-1).max().item()
-    elif _type == "entropix":
-      if "metrics" not in kwargs:
-        raise ValueError("'metrics' parameter is required for entropix sampling")
-      config = SamplerConfig()
-      metrics = kwargs["metrics"]
-      ent, vent = metrics["logits_entropy"], metrics["logits_varentropy"]
-      attn_ent, attn_vent = metrics["attn_entropy"], metrics["attn_varentropy"]
-
-      LELV = (
-        ent < config.low_logits_entropy_threshold
-        and vent < config.low_logits_varentropy_threshold
-        and attn_ent < config.low_attention_entropy_threshold
-        and attn_vent < config.low_attention_varentropy_threshold
-      )
-      HELV = (
-        ent > config.high_logits_entropy_threshold
-        and vent < config.low_logits_varentropy_threshold
-        and attn_ent < config.low_attention_entropy_threshold
-        and attn_vent < config.low_attention_varentropy_threshold
-      )
-      LEHV = (
-        ent < config.high_logits_entropy_threshold
-        and vent > config.high_logits_varentropy_threshold
-        and attn_ent < config.low_attention_entropy_threshold
-        and attn_vent > config.high_attention_varentropy_threshold
-      )
-      HEHV = (
-        ent > config.medium_logits_entropy_threshold
-        and vent > config.high_logits_varentropy_threshold
-        and attn_ent > config.high_attention_entropy_threshold
-        and attn_vent > config.high_attention_varentropy_threshold
-      )
-
-      if LELV:  # argmax
-        # Low Entropy, Low Varentropy: "flowing with unspoken intent"
-        cutoff = 1
-      elif HELV:
-        # High Entropy, Low Varentropy: "treading carefully, asking clarifying questions"
-        clarifying_question_token = 2564
-        cutoff = 1
-        candidates = [[clarifying_question_token]]
-        logprobs = torch.tensor([[0.0]])
-        print("helv")
-      elif LEHV:
-        # Low Entropy, High Varentropy: "exploring forks in the path"
-        probs = torch.exp(logprobs)
-        topk_cutoff = config.top_k
-        minp_cutoff = (probs > config.min_probability).sum(dim=-1).max().item()
-        sorted_probs = torch.sort(probs, dim=-1, descending=True)[0]
-        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
-        topp_cutoff = (cumsum_probs <= config.top_p).sum(dim=-1).max().item()
-        cutoff = min(topk_cutoff, minp_cutoff, topp_cutoff)
-        temp = config.temperature
-        print("lehv")
-      elif HEHV:
-        # High Entropy, High Varentropy: "resampling in the mist"
-        temp = (
-          config.high_entropy_varentropy_attention_offset
-          + config.high_entropy_varentropy_attention_coefficient * attn_vent
-        )
-        top_p_adj = torch.maximum(
-          torch.tensor(0.5),
-          config.top_p - config.high_entropy_attention_coefficient * attn_ent,
-        )
-        probs = torch.exp(logprobs)
-        topk_cutoff = config.top_k
-        minp_cutoff = (probs > config.min_probability).sum(dim=-1).max().item()
-        sorted_probs = torch.sort(probs, dim=-1, descending=True)[0]
-        cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
-        topp_cutoff = (cumsum_probs <= top_p_adj).sum(dim=-1).max().item()
-        cutoffs = [topk_cutoff, minp_cutoff, topp_cutoff]
-        cutoff = min([cutoff for cutoff in cutoffs if cutoff > 0])
-        print("hehv")
-      else:
-        # should be adaptive sampling but argmax for now
-        cutoff = 1
     else:
       raise ValueError(f"Unknown sampling type: {_type}")
 
@@ -398,35 +276,6 @@ class Sampler:
     idx = torch.multinomial(torch.exp(logprobs), num_samples=1).squeeze()
     batch_indices = torch.arange(candidates.shape[0])
     return candidates[batch_indices, idx].view(-1, 1), logprobs[batch_indices, idx]
-
-  @staticmethod
-  def calculate_ent_vent(
-    logits: torch.Tensor, axis: int = -1
-  ) -> tuple[torch.Tensor, torch.Tensor]:
-    logprobs = F.log_softmax(logits, dim=axis)
-    probs = torch.exp(logprobs)
-    entropy = -torch.sum(probs * logprobs, dim=axis) / LN_2
-    varentropy = torch.sum(
-      probs * (logprobs / LN_2 + entropy.unsqueeze(-1)) ** 2, dim=axis
-    )
-    return entropy, varentropy
-
-  @staticmethod
-  def calculate_metrics(
-    logits: torch.Tensor, attn_scores: torch.Tensor
-  ) -> dict[str, torch.Tensor]:
-    entropy, varentropy = Sampler.calculate_ent_vent(logits)
-    attn_probs = F.softmax(attn_scores, dim=-1)
-    attn_entropy = -torch.sum(
-      attn_probs * torch.log2(torch.clamp(attn_probs, 1e-10, 1.0)), dim=-1
-    )
-    attn_varentropy = torch.var(attn_entropy, dim=1)
-    return {
-      "logits_entropy": torch.mean(entropy),
-      "logits_varentropy": torch.mean(varentropy),
-      "attn_entropy": torch.mean(attn_entropy),
-      "attn_varentropy": torch.mean(attn_varentropy),
-    }
 
 
 class Llama:
@@ -587,12 +436,9 @@ class Llama:
         x = tokens[:, -1:]
         attn_mask = torch.tensor([0]).to(device=device)
         freqs_cis = self.freqs_cis_all[cur_pos : cur_pos + 1]
-      logits, self.kvcache, scores = self.xfmr(
-        x, self.kvcache, cur_pos, attn_mask, freqs_cis
-      )  # type: ignore
-      metrics = Sampler.calculate_metrics(logits, scores)
+      logits, self.kvcache = self.xfmr(x, self.kvcache, cur_pos, attn_mask, freqs_cis)  # type: ignore
       candidates, logprobs = Sampler.get_candidates(
-        logits, sampler, temp=temp, metrics=metrics, **kwargs
+        logits, sampler, temp=temp, **kwargs
       )
       next_token, _ = Sampler.random_choice(candidates, logprobs, sampler)
       is_stop = next_token[0] in self.stop_tokens
@@ -615,10 +461,6 @@ class Llama:
           {"token": self.tokenizer.decode([token]), "logprob": logprob}
           for token, logprob in zip(candidates[0].tolist(), logprobs[0].tolist())  # type: ignore
         ],
-        "logits_entropy": metrics["logits_entropy"].item(),
-        "logits_varentropy": metrics["logits_varentropy"].item(),
-        "attn_entropy": metrics["attn_entropy"].item(),
-        "attn_varentropy": metrics["attn_varentropy"].item(),
       }
       if is_stop:
         break
@@ -633,6 +475,5 @@ if __name__ == "__main__":
   llama = Llama(is_instruct, LLAMA_1B_PARAMS, weight_path, tok_path, len(prompts))
   tokens, attn_mask = llama.tokenize(prompts, format_instruct=True)
   print(llama.detokenize(tokens[0]))
-  for chunk in llama.generate(tokens, attn_mask, sampler="entropix", temp=0.6, k=40):
-    # print(chunk)
+  for chunk in llama.generate(tokens, attn_mask, sampler="topk", temp=0.6, k=40):
     print(chunk["choices"][0]["delta"]["content"], end="", flush=True)
